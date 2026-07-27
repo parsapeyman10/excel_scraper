@@ -117,8 +117,10 @@ def export_excel(report: ValidationReport, path: str | Path) -> Path:
     ws.title = "Summary"
     ws["A1"] = f"{APP_NAME} — Validation Report"
     ws["A1"].font = title_font
+    src = report.metadata.get("source_files") or {}
     meta = [
         ("Source file", Path(report.source_file).name),
+        ("Input mode", report.metadata.get("source_mode", "single")),
         ("SHA-256", report.source_sha256),
         ("Profile", report.profile_name),
         ("Generated", report.generated_at.strftime("%Y-%m-%d %H:%M:%S UTC")),
@@ -128,6 +130,11 @@ def export_excel(report: ValidationReport, path: str | Path) -> Path:
         ("Header row", report.mapping.header_row + 1),
         ("Mapping confidence", f"{report.mapping.confidence:.0%}"),
     ]
+    if src.get("mode") == "multi":
+        meta += [
+            ("TOP file", Path(src["top"]).name if src.get("top") else "—"),
+            ("BOT file", Path(src["bot"]).name if src.get("bot") else "—"),
+        ]
     for i, (k, v) in enumerate(meta, start=3):
         ws.cell(i, 1, k).font = Font(bold=True)
         ws.cell(i, 2, v)
@@ -395,7 +402,7 @@ def export_html(report: ValidationReport, path: str | Path) -> Path:
 <style>{_HTML_CSS}</style></head><body>
 <header>
  <h1>{e(APP_NAME)} — Validation Report</h1>
- <div class="sub">{e(Path(report.source_file).name)} &nbsp;·&nbsp; profile
+ <div class="sub">{e(report.source_label)} &nbsp;·&nbsp; profile
  <b>{e(report.profile_name)}</b> &nbsp;·&nbsp;
  {report.generated_at.strftime('%Y-%m-%d %H:%M:%S UTC')} &nbsp;·&nbsp;
  sha256 <code>{e(report.source_sha256[:16])}…</code></div>
@@ -458,7 +465,7 @@ def export_markdown(report: ValidationReport, path: str | Path) -> Path:
     p.parent.mkdir(parents=True, exist_ok=True)
     s = report.summary
     lines = [
-        f"# BOM Validation Report — {Path(report.source_file).name}",
+        f"# BOM Validation Report — {report.source_label}",
         "",
         f"*Generated {report.generated_at:%Y-%m-%d %H:%M:%S} UTC · profile "
         f"`{report.profile_name}` · engine v{__version__}*",

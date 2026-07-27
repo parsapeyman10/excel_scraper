@@ -258,6 +258,17 @@ class ValidationReport:
     summary: ValidationSummary = field(default_factory=ValidationSummary)
     metadata: dict[str, Any] = field(default_factory=dict)
     duration_ms: float = 0.0
+    # populated by the engine; ``None`` for reports rebuilt from JSON
+    sources: Any = None
+
+    @property
+    def source_label(self) -> str:
+        """Human label of the input(s) — one file name, or all three."""
+        if self.sources is not None:
+            return self.sources.label
+        from pathlib import Path as _P
+
+        return _P(self.source_file).name
 
     def recompute_summary(self) -> ValidationSummary:
         s = ValidationSummary()
@@ -288,6 +299,11 @@ class ValidationReport:
         return {
             "schema": "bom-validation-report/1.0",
             "source_file": self.source_file,
+            "sources": (
+                self.sources.to_dict()
+                if self.sources is not None
+                else {"mode": "single", "bom": self.source_file, "top": "", "bot": ""}
+            ),
             "source_sha256": self.source_sha256,
             "generated_at": self.generated_at.isoformat(),
             "profile": self.profile_name,

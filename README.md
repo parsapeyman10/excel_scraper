@@ -15,9 +15,13 @@ seven report formats and a local audit trail.
 
 ## What it does
 
-Given one workbook containing a BOM sheet plus `top` / `bot` placement sheets, it:
+Feed it either **one workbook** containing a BOM sheet plus `top` / `bot`
+placement sheets, or **three separate files** — the *مونتاژ ماشینی* (machine
+assembly) BOM, the TOP pick-and-place export and the BOT one. Then it:
 
 1. **Finds the sheets automatically** — Persian or English names, fuzzy matched.
+   In three-file mode the layer comes from the file you dropped it in, so a
+   placement export named `Sheet1` works fine.
 2. **Detects the header row** with a confidence score, merging split
    sub-headers (the classic `Stock No.` sitting one row below the banner).
 3. **Normalises everything** — Persian/Arabic digits, Arabic yeh/kaf, zero-width
@@ -65,11 +69,25 @@ bom-validator                      # or: python -m bom_validator
 bom-validator board.xlsx           # open a file directly
 ```
 
+The control panel has an **input mode** switch:
+
+| Mode | Slots | Use it when |
+|---|---|---|
+| One combined workbook | a single file picker | the workbook already holds the BOM sheet plus its `top`/`bot` tabs |
+| Three separate files | مونتاژ ماشینی (BOM) · TOP · BOT | the machine room exports each layer as its own file |
+
+Either slot accepts drag-and-drop, and one of TOP/BOT may be left empty for a
+single-sided board. Recent selections remember the whole three-file set.
+
 ### Command line
 
 ```bash
 # validate and gate a CI build
 bomv validate board.xlsx --profile strict --fail-on error
+
+# three separate files: BOM plus one file per layer
+bomv validate montaj.xlsx --top-file top.xlsx --bot-file bot.xlsx
+bomv inspect  montaj.xlsx --top-file top.xlsx --bot-file bot.xlsx
 
 # write several reports at once
 bomv validate board.xlsx -r xlsx:out.xlsx -r html:out.html -r junit:results.xml
@@ -108,6 +126,19 @@ for line in report.failing:
 
 from bom_validator.reporting import exporters
 exporters.export(report, "html", "report.html")
+```
+
+Three separate files:
+
+```python
+from bom_validator import validate_sources, SourceSet
+
+report = validate_sources("montaj.xlsx", "top.xlsx", "bot.xlsx")
+print(report.metadata["source_mode"])       # 'multi'
+print(report.source_label)                  # BOM:montaj.xlsx + TOP:… + BOT:…
+
+# a SourceSet is accepted anywhere a path is
+validate_file(SourceSet.multi("montaj.xlsx", top="top.xlsx"))
 ```
 
 ---
@@ -207,6 +238,7 @@ Windows). Create one from the GUI (`Tools → Validation profiles`) or with
 bom_validator/
 ├── models.py            immutable domain types (BomLine, Placement, Issue…)
 ├── config.py            profiles, app settings, cross-platform data dirs
+├── sources.py           input sets: one workbook, or BOM + top + bot files
 ├── cli.py               argparse CLI: validate | batch | diff | inspect | …
 ├── core/
 │   ├── normalize.py     unicode/digit folding, designator range expansion
@@ -216,7 +248,8 @@ bom_validator/
 ├── io_excel/reader.py   openpyxl reader, sheet classifier, header detector
 ├── reporting/           xlsx · html · pdf · csv · json · md · junit
 ├── storage/history.py   SQLite audit trail with trend queries
-└── gui/                 PyQt6: main window, Qt models, themes, board map
+└── gui/                 PyQt6: main window, Qt models, themes, board map,
+                         widgets/sources.py = the input-mode selector
 ```
 
 The core has **no Qt dependency** — it runs identically in a container, a

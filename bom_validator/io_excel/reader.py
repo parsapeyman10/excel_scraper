@@ -369,6 +369,11 @@ def _matches(name: str, patterns: Sequence[str]) -> bool:
     return any(nz.canonical(p) in key for p in patterns if p)
 
 
+def matches_patterns(name: str, patterns: Sequence[str]) -> bool:
+    """Public alias of the sheet-name matcher (used by the engine)."""
+    return _matches(name, patterns)
+
+
 def classify_sheets(
     names: Sequence[str], profile: ValidationProfile
 ) -> dict[str, list[str]]:

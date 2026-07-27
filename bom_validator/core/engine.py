@@ -21,8 +21,8 @@ from ..models import (
     Severity,
     Status,
     ValidationReport,
-    sha256_file,
 )
+from ..sources import SourceSet
 from . import normalize as nz
 from .rules import RuleContext, build_rules
 
@@ -50,13 +50,14 @@ class BomValidationEngine:
     # ------------------------------------------------------------------
     def run(
         self,
-        file_path: str | Path,
+        file_path: str | Path | SourceSet,
         *,
         progress: ProgressCb = None,
         cancel: CancelCb = None,
     ) -> ValidationReport:
         started = time.perf_counter()
-        path = Path(file_path)
+        sources = SourceSet.coerce(file_path).validate()
+        path = sources.primary
 
         def tick(done: int, total: int, msg: str) -> None:
             if cancel and cancel():
@@ -71,14 +72,17 @@ class BomValidationEngine:
 
         report = ValidationReport(
             source_file=str(path),
-            source_sha256=sha256_file(str(path)),
+            source_sha256=sources.sha256(),
             profile_name=self.profile.name,
         )
+        report.sources = sources
         report.metadata = {
             "sheets": names,
             "sheet_roles": buckets,
-            "file_size_bytes": path.stat().st_size,
-            "engine_version": 2,
+            "file_size_bytes": sources.total_size(),
+            "engine_version": 3,
+            "source_mode": sources.mode,
+            "source_files": sources.to_dict(),
         }
 
         # -- BOM sheet ------------------------------------------------
@@ -106,15 +110,24 @@ class BomValidationEngine:
 
         # -- placement sheets ------------------------------------------
         tick(40, 100, "reading placement sheets")
-        placements = self._read_placements(loader, buckets)
+        if sources.is_multi:
+            placements, place_roles = self._read_placements_multi(sources)
+            report.metadata["placement_sheet_roles"] = place_roles
+        else:
+            placements = self._read_placements(loader, buckets)
         self.last_placements = placements
         if not placements:
             report.global_issues.append(
                 Issue(
                     "NO_PLACEMENT_SHEET",
                     Severity.CRITICAL,
-                    "No 'top' or 'bot' placement sheet was found; every line will "
-                    "report zero placements.",
+                    (
+                        "No placement rows could be read from the selected top/bot "
+                        "files; every line will report zero placements."
+                        if sources.is_multi
+                        else "No 'top' or 'bot' placement sheet was found; every "
+                        "line will report zero placements."
+                    ),
                 )
             )
 
@@ -138,6 +151,65 @@ class BomValidationEngine:
             report.duration_ms,
         )
         return report
+
+    # ------------------------------------------------------------------
+    def _read_placements_multi(
+        self, sources: SourceSet
+    ) -> tuple[list[Placement], dict[str, list[str]]]:
+        """Read the top / bot placement files supplied as separate workbooks.
+
+        Inside a dedicated placement file the layer is implied by *which* file
+        it is, so every sheet of that file is parsed with that layer — except
+        sheets whose name explicitly says otherwise (a ``bot`` tab inside the
+        top export still counts as bottom).
+        """
+        jobs: list[tuple[Path, str, Layer]] = []
+        roles: dict[str, list[str]] = {"top": [], "bot": []}
+
+        for file_path, layer in ((sources.top, Layer.TOP), (sources.bot, Layer.BOT)):
+            if file_path is None:
+                continue
+            loader = rd.WorkbookLoader(file_path)
+            names = loader.sheet_names()
+            wanted = [
+                n
+                for n in names
+                if not rd.matches_patterns(n, self.profile.ignore_sheet_patterns)
+            ]
+            # a dedicated placement export often has a single default-named
+            # tab ("Sheet1"); never throw the whole file away for that
+            if not wanted:
+                wanted = names
+            for name in wanted:
+                sheet_layer = layer
+                if rd.matches_patterns(name, self.profile.bot_sheet_patterns):
+                    sheet_layer = Layer.BOT
+                elif rd.matches_patterns(name, self.profile.top_sheet_patterns):
+                    sheet_layer = Layer.TOP
+                jobs.append((file_path, name, sheet_layer))
+                roles[sheet_layer.value].append(f"{file_path.name}!{name}")
+
+        if not jobs:
+            return [], roles
+
+        def work(job: tuple[Path, str, Layer]) -> list[Placement]:
+            file_path, name, layer = job
+            sheet = rd.WorkbookLoader(file_path).sheets[name]
+            return rd.extract_placements(sheet, layer, self.profile)
+
+        if len(jobs) == 1:
+            return work(jobs[0]), roles
+
+        out: list[Placement] = []
+        workers = min(len(jobs), (os.cpu_count() or 2), 8)
+        if workers <= 1:
+            for job in jobs:
+                out += work(job)
+            return out, roles
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="place") as ex:
+            for chunk in ex.map(work, jobs):
+                out += chunk
+        return out, roles
 
     # ------------------------------------------------------------------
     def _read_placements(
@@ -351,9 +423,22 @@ class BomValidationEngine:
 
 
 def validate_file(
-    path: str | Path,
+    path: str | Path | SourceSet,
     profile: ValidationProfile | None = None,
     **kwargs,
 ) -> ValidationReport:
     """Convenience one-liner used by the CLI and tests."""
     return BomValidationEngine(profile).run(path, **kwargs)
+
+
+def validate_sources(
+    bom: str | Path,
+    top: str | Path | None = None,
+    bot: str | Path | None = None,
+    profile: ValidationProfile | None = None,
+    **kwargs,
+) -> ValidationReport:
+    """Validate a BOM workbook against separate top / bot placement files."""
+    return BomValidationEngine(profile).run(
+        SourceSet.multi(bom, top, bot), **kwargs
+    )
