@@ -19,6 +19,7 @@ import logging
 import sys
 from collections.abc import Sequence
 from pathlib import Path
+from typing import Any
 
 from .config import BUILTIN_PROFILES, ValidationProfile, profiles_dir
 from .core.diff import diff_reports
@@ -58,6 +59,17 @@ def _color(enabled: bool):
 
 
 # ---------------------------------------------------------------------------
+
+
+def _resolve_jobs(requested: int, n_files: int) -> int:
+    """How many workbooks to process concurrently."""
+    import os
+
+    if requested and requested > 0:
+        return max(1, min(requested, n_files))
+    if requested == 0:  # auto
+        return max(1, min((os.cpu_count() or 2), n_files, 8))
+    return 1
 
 
 def _load_profile(name_or_path: str | None) -> ValidationProfile:
@@ -224,21 +236,44 @@ def cmd_batch(args: argparse.Namespace) -> int:
     out_dir = Path(args.out) if args.out else root / "reports"
     out_dir.mkdir(parents=True, exist_ok=True)
     formats = [f.strip() for f in args.format.split(",") if f.strip()]
-    engine = BomValidationEngine(profile)
     store = HistoryStore() if not args.no_history else None
+    jobs = _resolve_jobs(getattr(args, "jobs", 0), len(files))
+
+    def work(path: Path):
+        # one engine per file so worker threads never share mutable state
+        report = BomValidationEngine(profile).run(path)
+        for fmt in formats:
+            exporters.export(report, fmt, out_dir / exporters.default_filename(report, fmt))
+        return report
 
     worst = EXIT_OK
     rows = []
-    for f in files:
-        try:
-            report = engine.run(f)
-        except Exception as exc:
-            print(f"  ✗ {f.name}: {exc}", file=sys.stderr)
-            worst = EXIT_ERROR
-            continue
+    results: list[tuple[Path, Any]] = []
+
+    if jobs > 1:
+        import concurrent.futures as _cf
+
+        with _cf.ThreadPoolExecutor(max_workers=jobs, thread_name_prefix="batch") as ex:
+            futures = {ex.submit(work, f): f for f in files}
+            for fut in _cf.as_completed(futures):
+                f = futures[fut]
+                try:
+                    results.append((f, fut.result()))
+                except Exception as exc:
+                    print(f"  ✗ {f.name}: {exc}", file=sys.stderr)
+                    worst = EXIT_ERROR
+        # deterministic output order regardless of completion order
+        results.sort(key=lambda kv: files.index(kv[0]))
+    else:
+        for f in files:
+            try:
+                results.append((f, work(f)))
+            except Exception as exc:
+                print(f"  ✗ {f.name}: {exc}", file=sys.stderr)
+                worst = EXIT_ERROR
+
+    for f, report in results:
         _print_summary(report, not args.no_color)
-        for fmt in formats:
-            exporters.export(report, fmt, out_dir / exporters.default_filename(report, fmt))
         if store:
             store.save(report, operator=args.operator or "")
         rows.append(
@@ -251,12 +286,13 @@ def cmd_batch(args: argparse.Namespace) -> int:
                 "health": round(report.summary.health_score, 1),
             }
         )
-        rc = _gate(report, args.fail_on)
-        worst = max(worst, rc)
+        worst = max(worst, _gate(report, args.fail_on))
 
     index = out_dir / "batch_summary.json"
     index.write_text(json.dumps(rows, indent=2), encoding="utf-8")
-    print(f"\nProcessed {len(rows)} file(s) → {out_dir}")
+    print(
+        f"\nProcessed {len(rows)} file(s) with {jobs} worker(s) → {out_dir}"
+    )
     return worst
 
 
@@ -416,6 +452,10 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("--fail-on", choices=list(_SEVERITY_GATES), default="error")
     b.add_argument("--operator")
     b.add_argument("--no-history", action="store_true")
+    b.add_argument(
+        "-j", "--jobs", type=int, default=0,
+        help="parallel workers (0 = auto, 1 = sequential)",
+    )
     b.set_defaults(func=cmd_batch)
 
     d = sub.add_parser("diff", help="compare two workbooks")

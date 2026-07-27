@@ -74,8 +74,9 @@ bomv validate board.xlsx --profile strict --fail-on error
 # write several reports at once
 bomv validate board.xlsx -r xlsx:out.xlsx -r html:out.html -r junit:results.xml
 
-# validate an entire folder
+# validate an entire folder (parallel by default; -j 1 forces sequential)
 bomv batch ./boards --glob "*.xlsx" --out ./reports --format xlsx,json
+bomv batch ./boards -j 8
 
 # compare two revisions
 bomv diff rev_a.xlsx rev_b.xlsx --md changes.md
@@ -107,6 +108,41 @@ for line in report.failing:
 
 from bom_validator.reporting import exporters
 exporters.export(report, "html", "report.html")
+```
+
+---
+
+## Performance
+
+The pipeline is tuned so the app feels instant on the shop floor, and every
+long operation runs off the UI thread.
+
+| Where | What changed |
+|---|---|
+| Workbook loading | Parsed grids are memoised in a byte-budgeted LRU cache keyed by path + mtime + size, so the preview, the validation run and the board map share a single parse instead of three. Concurrent first-time loads of the same file are de-duplicated. |
+| Header detection | Synonym tables are normalised once (not once per cell) and each sheet memoises its detected mapping per profile. |
+| Text normalisation | `clean()` has a fast path for the plain-ASCII cells that dominate real workbooks; `canonical()`, `header_key()`, designator expansion and similarity are all memoised. |
+| Fuzzy matching | `similarity_at_least()` discards hopeless candidates with an O(n) upper-bound probe before running the O(n·m) matcher — same scores, far fewer comparisons. |
+| Batch / CLI | `bomv batch` processes files on a thread pool (`-j`), with output ordered deterministically regardless of completion order. |
+| GUI | Workbook parsing, validation, comparison, export and history writes all run on `QThreadPool`. The results table pre-computes its display and search strings, shares brushes and fonts, and the search box is debounced. |
+
+Measured on this repo's sample plus two synthetic workbooks (4 000 BOM lines /
+14 000 placements, and a fuzzy-match-heavy 600-line board):
+
+| Workbook | Before | After |
+|---|---|---|
+| Sample board | 0.11 s | 0.10 s (0.01 s cached) |
+| 4 000 lines, 14 000 placements | 1.70 s | 1.50 s (0.37 s cached) |
+| Fuzzy-match heavy | 6.37 s | 1.41 s |
+
+Every optimisation is output-preserving: the test suite asserts byte-identical
+reports against the previous implementation for all built-in profiles.
+
+Caches are process-local and can be dropped at any time:
+
+```python
+from bom_validator import clear_caches
+clear_caches()
 ```
 
 ---
@@ -212,7 +248,7 @@ It appears immediately in the GUI rule list, the CLI catalog and every report.
 
 ```bash
 pip install -e ".[dev,all]"
-pytest                      # 138 tests
+pytest                      # 193 tests
 pytest --cov=bom_validator  # with coverage
 ruff check bom_validator
 mypy bom_validator

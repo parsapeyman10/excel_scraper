@@ -9,8 +9,11 @@ from __future__ import annotations
 import csv
 import logging
 import os
+import threading
 from collections.abc import Callable, Iterator, Sequence
-from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, replace
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +40,9 @@ class WorkbookError(RuntimeError):
 class SheetData:
     name: str
     rows: Grid
+    # memoised header detections keyed by profile fingerprint
+    _header_cache: dict[Any, Any] = None  # type: ignore[assignment]
+    _width: int = -1
 
     def __len__(self) -> int:
         return len(self.rows)
@@ -50,7 +56,119 @@ class SheetData:
 
     @property
     def width(self) -> int:
-        return max((len(r) for r in self.rows), default=0)
+        if self._width < 0:
+            self._width = max((len(r) for r in self.rows), default=0)
+        return self._width
+
+    # -- header memoisation -------------------------------------------
+    def cached_header(self, key: Any):
+        cache = self._header_cache
+        return cache.get(key) if cache else None
+
+    def store_header(self, key: Any, mapping: Any) -> None:
+        if self._header_cache is None:
+            self._header_cache = {}
+        self._header_cache[key] = mapping
+
+
+@lru_cache(maxsize=1)
+def _has_lxml() -> bool:
+    """openpyxl only releases the GIL while parsing when lxml is installed."""
+    try:
+        import lxml.etree  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
+class _GridCache:
+    """Tiny thread-safe LRU of parsed workbooks keyed by (path, mtime, size).
+
+    Opening the same workbook happens several times per run (engine, board
+    map, sheet preview). Parsing it once and sharing the immutable grids makes
+    the second and third open essentially free.
+    """
+
+    def __init__(self, max_entries: int = 4, max_bytes: int = 256 * 1024 * 1024) -> None:
+        self._lock = threading.RLock()
+        self._data: dict[tuple, dict[str, SheetData]] = {}
+        self._order: list[tuple] = []
+        self._cost: dict[tuple, int] = {}
+        self._loading: dict[tuple, threading.Lock] = {}
+        self.max_entries = max_entries
+        # keeping whole grids alive is the whole point, but never at the cost
+        # of exhausting a shop-floor PC's memory
+        self.max_bytes = max_bytes
+        self.hits = 0
+        self.misses = 0
+
+    def load_lock(self, key: tuple) -> threading.Lock:
+        """Serialise concurrent first-time loads of the same workbook.
+
+        The GUI kicks off a preview load and a validation at almost the same
+        moment; without this both threads would parse the file.
+        """
+        with self._lock:
+            lock = self._loading.get(key)
+            if lock is None:
+                lock = self._loading[key] = threading.Lock()
+            return lock
+
+    def get(self, key: tuple) -> dict[str, SheetData] | None:
+        with self._lock:
+            item = self._data.get(key)
+            if item is None:
+                self.misses += 1
+                return None
+            self.hits += 1
+            self._order.remove(key)
+            self._order.append(key)
+            return item
+
+    def put(self, key: tuple, value: dict[str, SheetData], cost: int = 0) -> None:
+        with self._lock:
+            if key in self._data:
+                self._order.remove(key)
+            self._data[key] = value
+            self._cost[key] = cost
+            self._order.append(key)
+            while self._order and (
+                len(self._order) > self.max_entries
+                or (
+                    len(self._order) > 1
+                    and sum(self._cost.values()) > self.max_bytes
+                )
+            ):
+                evicted = self._order.pop(0)
+                self._data.pop(evicted, None)
+                self._cost.pop(evicted, None)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._data.clear()
+            self._order.clear()
+            self._cost.clear()
+            self._loading.clear()
+            self.hits = self.misses = 0
+
+    def stats(self) -> dict[str, int]:
+        with self._lock:
+            return {
+                "entries": len(self._data),
+                "bytes": sum(self._cost.values()),
+                "hits": self.hits,
+                "misses": self.misses,
+            }
+
+
+GRID_CACHE = _GridCache()
+
+
+def clear_caches() -> None:
+    """Drop every memoised workbook/normalisation result."""
+    GRID_CACHE.clear()
+    _prepare_synonyms_cached.cache_clear()
+    nz.clear_caches()
 
 
 class WorkbookLoader:
@@ -60,19 +178,53 @@ class WorkbookLoader:
     LEGACY_EXT = {".xls"}
     TEXT_EXT = {".csv", ".tsv", ".txt"}
 
-    def __init__(self, path: str | os.PathLike[str], max_rows: int = 500_000):
+    def __init__(
+        self,
+        path: str | os.PathLike[str],
+        max_rows: int = 500_000,
+        *,
+        use_cache: bool = True,
+    ):
         self.path = Path(path)
         self.max_rows = max_rows
+        self.use_cache = use_cache
         if not self.path.exists():
             raise WorkbookError(f"File not found: {self.path}")
         self._sheets: dict[str, SheetData] | None = None
+        self._lock = threading.RLock()
 
     # -- public ------------------------------------------------------
+    def _cache_key(self) -> tuple:
+        st = self.path.stat()
+        return (str(self.path.resolve()), st.st_mtime_ns, st.st_size, self.max_rows)
+
     @property
     def sheets(self) -> dict[str, SheetData]:
-        if self._sheets is None:
-            self._sheets = self._load()
-        return self._sheets
+        if self._sheets is not None:
+            return self._sheets
+        with self._lock:
+            if self._sheets is not None:  # pragma: no cover - race guard
+                return self._sheets
+            if not self.use_cache:
+                self._sheets = self._load()
+                return self._sheets
+
+            key = self._cache_key()
+            cached = GRID_CACHE.get(key)
+            if cached is not None:
+                self._sheets = cached
+                return cached
+
+        # parse outside the instance lock, but only one thread per file
+        with GRID_CACHE.load_lock(key):
+            cached = GRID_CACHE.get(key)
+            if cached is None:
+                cached = self._load()
+                # the source file size is a good, cheap proxy for grid weight
+                GRID_CACHE.put(key, cached, cost=key[2] * 40)
+        with self._lock:
+            self._sheets = cached
+        return cached
 
     def sheet_names(self) -> list[str]:
         return list(self.sheets)
@@ -92,6 +244,28 @@ class WorkbookLoader:
         # last resort: let pandas sniff it
         return self._load_pandas()
 
+    # Parallel sheet loading only pays off when the XML parser releases the
+    # GIL (lxml) and there are cores to spare — otherwise the extra workbook
+    # handles just add overhead, so we stay on the serial path.
+    PARALLEL_SHEET_THRESHOLD = 3
+    PARALLEL_BYTES_THRESHOLD = 2 * 1024 * 1024
+    PARALLEL_MIN_CPUS = 4
+
+    def _read_sheet(self, ws) -> SheetData:
+        rows: Grid = []
+        append = rows.append
+        max_rows = self.max_rows
+        for i, row in enumerate(ws.iter_rows(values_only=True)):
+            if i >= max_rows:
+                log.warning("Sheet %s truncated at %d rows", ws.title, i)
+                break
+            # trim trailing empty cells: big win on sheets padded to 16k columns
+            end = len(row)
+            while end and row[end - 1] is None:
+                end -= 1
+            append(list(row[:end]) if end != len(row) else list(row))
+        return SheetData(ws.title, rows)
+
     def _load_openpyxl(self) -> dict[str, SheetData]:
         try:
             import openpyxl
@@ -101,21 +275,65 @@ class WorkbookLoader:
             wb = openpyxl.load_workbook(
                 self.path, data_only=True, read_only=True, keep_links=False
             )
+            names = list(wb.sheetnames)
         except Exception as exc:
             raise WorkbookError(f"Cannot open workbook: {exc}") from exc
+
+        try:
+            size = self.path.stat().st_size
+        except OSError:
+            size = 0
+
+        parallel = (
+            len(names) >= self.PARALLEL_SHEET_THRESHOLD
+            and size >= self.PARALLEL_BYTES_THRESHOLD
+            and (os.cpu_count() or 1) >= self.PARALLEL_MIN_CPUS
+            and _has_lxml()
+        )
+        if not parallel:
+            try:
+                return {ws.title: self._read_sheet(ws) for ws in wb.worksheets}
+            finally:
+                wb.close()
+
+        wb.close()
+        return self._load_openpyxl_parallel(openpyxl, names)
+
+    def _load_openpyxl_parallel(self, openpyxl, names: list[str]) -> dict[str, SheetData]:
+        """Read each worksheet from its own read-only workbook handle.
+
+        openpyxl's read-only reader is not thread-safe across a single
+        workbook, so every worker opens its own lazy handle. Decompression and
+        XML parsing release the GIL often enough that this scales well on
+        multi-sheet production workbooks.
+        """
+
+        def work(name: str) -> tuple[str, SheetData]:
+            wb = openpyxl.load_workbook(
+                self.path, data_only=True, read_only=True, keep_links=False
+            )
+            try:
+                return name, self._read_sheet(wb[name])
+            finally:
+                wb.close()
+
+        workers = min(len(names), (os.cpu_count() or 2), 8)
         out: dict[str, SheetData] = {}
         try:
-            for ws in wb.worksheets:
-                rows: Grid = []
-                for i, row in enumerate(ws.iter_rows(values_only=True)):
-                    if i >= self.max_rows:
-                        log.warning("Sheet %s truncated at %d rows", ws.title, i)
-                        break
-                    rows.append(list(row))
-                out[ws.title] = SheetData(ws.title, rows)
-        finally:
-            wb.close()
-        return out
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="sheet") as ex:
+                for name, data in ex.map(work, names):
+                    out[name] = data
+        except Exception as exc:
+            log.warning("Parallel sheet load failed (%s); falling back to serial", exc)
+            wb = openpyxl.load_workbook(
+                self.path, data_only=True, read_only=True, keep_links=False
+            )
+            try:
+                return {ws.title: self._read_sheet(ws) for ws in wb.worksheets}
+            finally:
+                wb.close()
+        # preserve original sheet order
+        return {name: out[name] for name in names if name in out}
 
     def _load_pandas(self) -> dict[str, SheetData]:
         try:
@@ -194,17 +412,33 @@ def _score_cell(text: str, synonyms: Sequence[str]) -> float:
     """Return 1.0 for exact synonym, 0.75 for containment, else 0."""
     if not text:
         return 0.0
-    for syn in synonyms:
-        s = nz.header_key(syn)
-        if not s:
-            continue
-        if text == s:
+    for s in synonyms:
+        if s and text == s:
             return 1.0
-    for syn in synonyms:
-        s = nz.header_key(syn)
+    for s in synonyms:
         if len(s) >= 3 and s in text:
             return 0.75
     return 0.0
+
+
+def _synonym_fingerprint(syns: dict[str, list[str]]) -> tuple:
+    """Content-based key so two equal synonym tables share a cache entry."""
+    return tuple((k, tuple(v)) for k, v in sorted(syns.items()))
+
+
+@lru_cache(maxsize=64)
+def _prepare_synonyms_cached(fingerprint: tuple) -> list[tuple[str, tuple[str, ...]]]:
+    prepared: list[tuple[str, tuple[str, ...]]] = []
+    for field_name, options in fingerprint:
+        keys = tuple(dict.fromkeys(k for k in (nz.header_key(o) for o in options) if k))
+        if keys:
+            prepared.append((field_name, keys))
+    return prepared
+
+
+def _prepare_synonyms(syns: dict[str, list[str]]) -> list[tuple[str, tuple[str, ...]]]:
+    """Pre-normalise the synonym table once instead of per cell."""
+    return _prepare_synonyms_cached(_synonym_fingerprint(syns))
 
 
 def detect_header(
@@ -223,14 +457,39 @@ def detect_header(
     scan = min(profile.header_scan_rows, len(sheet))
     best = SheetMapping(sheet_name=sheet.name)
 
+    cache_key = (
+        _synonym_fingerprint(syns),
+        scan,
+        profile.header_lookahead_rows,
+        tuple(profile.required_columns),
+        tuple(sorted(profile.manual_mapping.items())) if profile.manual_mapping else (),
+    )
+    cached = sheet.cached_header(cache_key)
+    if cached is not None:
+        # hand out a copy: callers (dialogs, engine) may mutate the mapping
+        return replace(cached, columns=dict(cached.columns))
+
+    prepared = _prepare_synonyms(syns)
+    row_keys: dict[int, list[tuple[int, str]]] = {}
+
+    def keys_for(rr: int) -> list[tuple[int, str]]:
+        """Normalised (column, key) pairs of a row — computed at most once."""
+        cachedrow = row_keys.get(rr)
+        if cachedrow is None:
+            cachedrow = []
+            for c, raw in enumerate(sheet.rows[rr]):
+                if raw is None:
+                    continue
+                text = nz.header_key(str(raw))
+                if text:
+                    cachedrow.append((c, text))
+            row_keys[rr] = cachedrow
+        return cachedrow
+
     for r in range(scan):
-        row = sheet.rows[r]
         found: dict[str, tuple[int, float]] = {}
-        for c, raw in enumerate(row):
-            text = nz.header_key(str(raw)) if raw is not None else ""
-            if not text:
-                continue
-            for field_name, options in syns.items():
+        for c, text in keys_for(r):
+            for field_name, options in prepared:
                 score = _score_cell(text, options)
                 if score > 0 and (
                     field_name not in found or score > found[field_name][1]
@@ -243,16 +502,13 @@ def detect_header(
             rr = r + look
             if rr >= len(sheet):
                 break
-            for c, raw in enumerate(sheet.rows[rr]):
-                text = nz.header_key(str(raw)) if raw is not None else ""
-                if not text:
-                    continue
-                for field_name, options in syns.items():
+            for c, text in keys_for(rr):
+                for field_name, options in prepared:
                     if field_name in found:
                         continue
-                    score = _score_cell(text, options)
-                    if score > 0:
-                        found[field_name] = (c, score * 0.9)
+                    sc = _score_cell(text, options)
+                    if sc > 0:
+                        found[field_name] = (c, sc * 0.9)
 
         required = [f for f in profile.required_columns if f in syns]
         hit = sum(1 for f in required if f in found)
@@ -275,6 +531,7 @@ def detect_header(
     if profile.manual_mapping:
         best.columns.update(profile.manual_mapping)
         best.detected_by = "manual-override"
+    sheet.store_header(cache_key, replace(best, columns=dict(best.columns)))
     return best
 
 

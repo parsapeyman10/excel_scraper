@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from functools import lru_cache
+
 PALETTES = {
     "industrial-light": {
         "bg": "#F0F2F5",
@@ -161,7 +163,9 @@ QFrame#kpiCard {{ background: {surface}; border: 1px solid {border}; border-radi
 """
 
 
+@lru_cache(maxsize=8)
 def stylesheet(theme: str = "industrial-light") -> str:
+    """Formatted QSS. Cached — re-applying a theme should be instant."""
     palette = PALETTES.get(theme, PALETTES["industrial-light"])
     return _TEMPLATE.format(**palette)
 
@@ -170,8 +174,8 @@ def palette(theme: str = "industrial-light") -> dict[str, str]:
     return PALETTES.get(theme, PALETTES["industrial-light"])
 
 
-def status_colors(theme: str) -> dict[str, tuple[str, str]]:
-    """status value -> (background, foreground)."""
+@lru_cache(maxsize=8)
+def _status_colors_cached(theme: str) -> dict[str, tuple[str, str]]:
     p = palette(theme)
     return {
         "PASS": (p["pass_bg"], p["pass"]),
@@ -180,3 +184,8 @@ def status_colors(theme: str) -> dict[str, tuple[str, str]]:
         "NOT_PLACED": (p["crit_bg"], p["crit"]),
         "UNKNOWN": (p["surface_alt"], p["muted"]),
     }
+
+
+def status_colors(theme: str) -> dict[str, tuple[str, str]]:
+    """status value -> (background, foreground). Returns a private copy."""
+    return dict(_status_colors_cached(theme))

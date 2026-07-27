@@ -284,3 +284,208 @@ class TestMainWindow:
         w.open_file(str(tmp_path / "ghost.xlsx"))
         assert w.report is None
         w.close()
+
+
+def _drain(qapp, predicate, timeout_ms: int = 30_000) -> bool:
+    """Spin the event loop until *predicate* holds (or we give up)."""
+    import time
+
+    deadline = time.monotonic() + timeout_ms / 1000
+    while time.monotonic() < deadline:
+        QThreadPool.globalInstance().waitForDone(50)
+        qapp.processEvents()
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return predicate()
+
+
+class TestBackgroundWorkers:
+    def test_workbook_load_worker(self, qapp, make_workbook):
+        from bom_validator.gui.workers import WorkbookLoadWorker
+
+        got: list = []
+        worker = WorkbookLoadWorker(str(make_workbook()))
+        worker.signals.finished.connect(lambda loader, names: got.append(names))
+        worker.signals.failed.connect(lambda m: got.append(m))
+        QThreadPool.globalInstance().start(worker)
+        assert _drain(qapp, lambda: bool(got))
+        assert "top" in got[0] and "bot" in got[0]
+
+    def test_workbook_load_worker_reports_failure(self, qapp, tmp_path):
+        from bom_validator.gui.workers import WorkbookLoadWorker
+
+        failures: list[str] = []
+        worker = WorkbookLoadWorker(str(tmp_path / "missing.xlsx"))
+        worker.signals.failed.connect(failures.append)
+        QThreadPool.globalInstance().start(worker)
+        assert _drain(qapp, lambda: bool(failures))
+        assert "missing.xlsx" in failures[0]
+
+    def test_validation_worker_returns_placements(self, qapp, make_workbook):
+        from bom_validator.config import ValidationProfile
+        from bom_validator.gui.workers import ValidationWorker
+
+        done: list[tuple] = []
+        worker = ValidationWorker(str(make_workbook()), ValidationProfile())
+        worker.signals.finished.connect(lambda r, p: done.append((r, p)))
+        QThreadPool.globalInstance().start(worker)
+        assert _drain(qapp, lambda: bool(done))
+        report, placements = done[0]
+        assert report.summary.total_lines == 3
+        assert len(placements) == 6
+
+    def test_validation_worker_can_be_cancelled(self, qapp, make_workbook):
+        from bom_validator.config import ValidationProfile
+        from bom_validator.gui.workers import ValidationWorker
+
+        events: list[str] = []
+        worker = ValidationWorker(str(make_workbook()), ValidationProfile())
+        worker.signals.cancelled.connect(lambda: events.append("cancelled"))
+        worker.signals.finished.connect(lambda *_: events.append("finished"))
+        worker.cancel()
+        QThreadPool.globalInstance().start(worker)
+        assert _drain(qapp, lambda: bool(events))
+        assert events == ["cancelled"]
+
+    def test_history_save_worker(self, qapp, make_workbook, tmp_path):
+        from bom_validator.gui.workers import HistorySaveWorker
+        from bom_validator.storage.history import HistoryStore
+
+        store = HistoryStore(tmp_path / "h.sqlite3")
+        report = validate_file(make_workbook())
+        ids: list[int] = []
+        worker = HistorySaveWorker(store, report, "operator-1")
+        worker.signals.finished.connect(ids.append)
+        QThreadPool.globalInstance().start(worker)
+        assert _drain(qapp, lambda: bool(ids))
+        assert ids[0] > 0
+        assert store.recent(5)[0].operator == "operator-1"
+
+    def test_batch_worker_processes_every_file(self, qapp, make_workbook, tmp_path):
+        from bom_validator.config import ValidationProfile
+        from bom_validator.gui.workers import BatchWorker
+
+        files = [str(make_workbook(f"batch{i}.xlsx")) for i in range(4)]
+        out = tmp_path / "reports"
+        counts: list[int] = []
+        seen: list[str] = []
+        worker = BatchWorker(files, ValidationProfile(), str(out), ["json"], workers=3)
+        worker.signals.file_done.connect(lambda f, r: seen.append(f))
+        worker.signals.finished.connect(counts.append)
+        QThreadPool.globalInstance().start(worker)
+        assert _drain(qapp, lambda: bool(counts))
+        assert counts[0] == 4
+        assert sorted(seen) == sorted(files)
+        assert len(list(out.glob("*.json"))) == 4
+
+
+class TestSearchModel:
+    def test_multi_token_search_is_anded(self, qapp, report):
+        m = ResultTableModel(Translator("en"))
+        m.set_report(report)
+        proxy = ResultFilterProxy()
+        proxy.setSourceModel(m)
+        proxy.set_text("resistor 10k")
+        assert proxy.rowCount() == 1
+        proxy.set_text("resistor capacitor")
+        assert proxy.rowCount() == 0
+
+    def test_search_is_case_insensitive(self, qapp, report):
+        m = ResultTableModel(Translator("en"))
+        m.set_report(report)
+        proxy = ResultFilterProxy()
+        proxy.setSourceModel(m)
+        proxy.set_text("MCU")
+        assert proxy.rowCount() == 1
+
+    def test_haystack_tracks_note_edits(self, qapp, report):
+        m = ResultTableModel(Translator("en"))
+        m.set_report(report)
+        col = [c[0] for c in ResultTableModel.COLUMNS].index("note")
+        m.setData(m.index(0, col), "needs rework", Qt.ItemDataRole.EditRole)
+        proxy = ResultFilterProxy()
+        proxy.setSourceModel(m)
+        proxy.set_text("rework")
+        assert proxy.rowCount() == 1
+
+    def test_shared_brushes_are_reused(self, qapp, report):
+        m = ResultTableModel(Translator("en"))
+        m.set_report(report)
+        a = m.data(m.index(0, 1), Qt.ItemDataRole.BackgroundRole)
+        b = m.data(m.index(0, 2), Qt.ItemDataRole.BackgroundRole)
+        assert a is b
+
+
+class TestWindowAsyncLoading:
+    def test_sheet_list_populates_asynchronously(self, qapp, make_workbook):
+        from bom_validator.gui.main_window import MainWindow
+
+        w = MainWindow()
+        w.open_file(str(make_workbook()))
+        assert _drain(qapp, lambda: w.cmb_sheet.count() > 0)
+        names = [w.cmb_sheet.itemText(i) for i in range(w.cmb_sheet.count())]
+        assert "top" in names and "bot" in names
+        w.close()
+
+    def test_stale_load_is_ignored(self, qapp, make_workbook):
+        from bom_validator.gui.main_window import MainWindow
+
+        w = MainWindow()
+        w.current_file = "/some/other/file.xlsx"
+        w._on_workbook_loaded("/an/older/file.xlsx", object(), ["ghost"])
+        assert w.cmb_sheet.count() == 0
+        w.close()
+
+    def test_repeated_theme_apply_is_a_noop(self, qapp):
+        from bom_validator.gui.main_window import MainWindow
+
+        w = MainWindow()
+        w.apply_theme("industrial-dark")
+        css = w.styleSheet()
+        w.apply_theme("industrial-dark")
+        assert w.styleSheet() == css
+        w.apply_theme("industrial-light")
+        assert w.styleSheet() != css
+        w.close()
+
+
+class TestAsyncDiff:
+    def test_compare_runs_off_the_ui_thread(self, qapp, make_workbook, monkeypatch):
+        from PyQt6.QtWidgets import QDialog, QFileDialog
+
+        from bom_validator.gui.main_window import MainWindow
+
+        a = str(make_workbook("rev_a.xlsx"))
+        b = str(make_workbook("rev_b.xlsx", lines=[
+            ("1", "C1, C2, C3", "Capacitor 100nF", "SMD", "0402", 3, "ACME", "1000001"),
+        ]))
+        monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *x, **k: (b, ""))
+        monkeypatch.setattr(QDialog, "exec", lambda self: 0)
+
+        w = MainWindow()
+        w.open_file(a)
+        assert _drain(qapp, lambda: w.report is not None)
+        w.compare_revision()
+        assert _drain(qapp, lambda: "change" in w.statusBar().currentMessage())
+        w.close()
+
+    def test_compare_failure_is_reported(self, qapp, make_workbook, monkeypatch):
+        from PyQt6.QtWidgets import QFileDialog, QMessageBox
+
+        from bom_validator.gui.main_window import MainWindow
+
+        monkeypatch.setattr(
+            QFileDialog, "getOpenFileName", lambda *x, **k: ("/no/such/file.xlsx", "")
+        )
+        shown: list[str] = []
+        monkeypatch.setattr(
+            QMessageBox, "critical", lambda *a, **k: shown.append(str(a[2]))
+        )
+        w = MainWindow()
+        w.open_file(str(make_workbook()))
+        assert _drain(qapp, lambda: w.report is not None)
+        w.compare_revision()
+        assert _drain(qapp, lambda: bool(shown))
+        assert "file.xlsx" in shown[0].lower()
+        w.close()
