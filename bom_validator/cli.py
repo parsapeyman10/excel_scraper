@@ -3,6 +3,7 @@
 Examples
 --------
     bomv validate board.xlsx --profile strict --report html:out.html --fail-on error
+    bomv validate montaj.xlsx --top-file top.xlsx --bot-file bot.xlsx
     bomv batch ./boards --glob "*.xlsx" --out ./reports --format xlsx,json
     bomv diff old.xlsx new.xlsx --md diff.md
     bomv inspect board.xlsx
@@ -28,6 +29,7 @@ from .core.rules import rule_catalog
 from .io_excel import reader as rd
 from .models import Severity, Status
 from .reporting import exporters
+from .sources import SourceError, SourceSet
 from .storage.history import HistoryStore
 from .version import APP_NAME, __version__
 
@@ -96,10 +98,19 @@ def _apply_overrides(profile: ValidationProfile, args: argparse.Namespace) -> No
         profile.bot_sheet_patterns = [args.bot_sheet]
 
 
+def _sources_from_args(args: argparse.Namespace) -> SourceSet:
+    """Build the input set: one workbook, or BOM + top + bot files."""
+    top = getattr(args, "top_file", None)
+    bot = getattr(args, "bot_file", None)
+    if top or bot:
+        return SourceSet.multi(args.file, top, bot).validate()
+    return SourceSet.single(args.file).validate()
+
+
 def _print_summary(report, colored: bool = True) -> None:
     c = _color(colored)
     s = report.summary
-    print(f"\n{c['b']}{Path(report.source_file).name}{c['0']}  "
+    print(f"\n{c['b']}{report.source_label}{c['0']}  "
           f"{c['dim']}profile={report.profile_name} "
           f"sheet='{report.mapping.sheet_name}' "
           f"conf={report.mapping.confidence:.0%} "
@@ -191,8 +202,9 @@ def cmd_validate(args: argparse.Namespace) -> int:
             print(f"\r  [{done:>3}/{total}] {msg:<28}", end="", file=sys.stderr)
 
     try:
-        report = engine.run(args.file, progress=progress if args.verbose else None)
-    except rd.WorkbookError as exc:
+        sources = _sources_from_args(args)
+        report = engine.run(sources, progress=progress if args.verbose else None)
+    except (rd.WorkbookError, SourceError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_ERROR
     if args.verbose:
@@ -316,30 +328,40 @@ def cmd_diff(args: argparse.Namespace) -> int:
 
 def cmd_inspect(args: argparse.Namespace) -> int:
     profile = _load_profile(args.profile)
-    loader = rd.WorkbookLoader(args.file)
-    buckets = rd.classify_sheets(loader.sheet_names(), profile)
+    sources = _sources_from_args(args)
     print(f"\n{APP_NAME} — workbook inspection\n{'=' * 60}")
-    print(f"File   : {args.file}")
-    print(f"Sheets : {len(loader.sheet_names())}")
-    for role, names in buckets.items():
-        if names:
-            print(f"  {role:<6}: {', '.join(names)}")
-    for name, sheet in loader.sheets.items():
-        mapping = rd.detect_header(sheet, profile)
-        print(f"\n--- {name}  ({len(sheet)} rows × {sheet.width} cols)")
-        if mapping.header_row >= 0:
-            print(
-                f"    header row {mapping.header_row + 1}, "
-                f"confidence {mapping.confidence:.0%}"
-            )
-            for field_name, idx in sorted(mapping.columns.items(), key=lambda kv: kv[1]):
-                header = sheet.cell(mapping.header_row, idx)
-                print(f"      {field_name:<12} → col {idx:>3}  {str(header)[:40]!r}")
-        else:
-            print("    no header detected")
-        if args.preview:
-            for row in rd.iter_preview(sheet, rows=args.preview, cols=12):
-                print("      " + " | ".join(str(v)[:16] if v is not None else "" for v in row))
+    print(f"Mode   : {sources.mode}")
+    for file_path in sources.paths:
+        loader = rd.WorkbookLoader(file_path)
+        buckets = rd.classify_sheets(loader.sheet_names(), profile)
+        print(f"\nFile   : {file_path}  [{sources.role_of(file_path)}]")
+        print(f"Sheets : {len(loader.sheet_names())}")
+        for role, names in buckets.items():
+            if names:
+                print(f"  {role:<6}: {', '.join(names)}")
+        for name, sheet in loader.sheets.items():
+            mapping = rd.detect_header(sheet, profile)
+            print(f"\n--- {name}  ({len(sheet)} rows × {sheet.width} cols)")
+            if mapping.header_row >= 0:
+                print(
+                    f"    header row {mapping.header_row + 1}, "
+                    f"confidence {mapping.confidence:.0%}"
+                )
+                for field_name, idx in sorted(
+                    mapping.columns.items(), key=lambda kv: kv[1]
+                ):
+                    header = sheet.cell(mapping.header_row, idx)
+                    print(f"      {field_name:<12} → col {idx:>3}  {str(header)[:40]!r}")
+            else:
+                print("    no header detected")
+            if args.preview:
+                for row in rd.iter_preview(sheet, rows=args.preview, cols=12):
+                    print(
+                        "      "
+                        + " | ".join(
+                            str(v)[:16] if v is not None else "" for v in row
+                        )
+                    )
     return EXIT_OK
 
 
@@ -427,8 +449,11 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--top-sheet", help="explicit top sheet name pattern")
         p.add_argument("--bot-sheet", help="explicit bottom sheet name pattern")
 
-    v = sub.add_parser("validate", help="validate a single workbook")
-    v.add_argument("file")
+    v = sub.add_parser(
+        "validate",
+        help="validate one workbook, or a BOM plus separate top/bot files",
+    )
+    v.add_argument("file", help="the workbook (or, with --top-file/--bot-file, the BOM)")
     add_profile_opts(v)
     v.add_argument(
         "-r", "--report", action="append", default=[],
@@ -439,6 +464,14 @@ def build_parser() -> argparse.ArgumentParser:
     v.add_argument("--limit", type=int, default=25, help="max findings printed")
     v.add_argument("--json-only", action="store_true", help="print machine JSON only")
     v.add_argument("-q", "--quiet", action="store_true", help="summary only")
+    v.add_argument(
+        "--top-file",
+        help="separate TOP pick-and-place file (three-file mode)",
+    )
+    v.add_argument(
+        "--bot-file",
+        help="separate BOT pick-and-place file (three-file mode)",
+    )
     v.add_argument("--operator", help="operator name recorded in history")
     v.add_argument("--no-history", action="store_true")
     v.set_defaults(func=cmd_validate)
@@ -472,6 +505,8 @@ def build_parser() -> argparse.ArgumentParser:
     i.add_argument("file")
     i.add_argument("-p", "--profile")
     i.add_argument("--preview", type=int, default=0, help="preview N rows per sheet")
+    i.add_argument("--top-file", help="separate TOP placement file")
+    i.add_argument("--bot-file", help="separate BOT placement file")
     i.set_defaults(func=cmd_inspect)
 
     pr = sub.add_parser("profile", help="manage validation profiles")

@@ -1,7 +1,7 @@
 """Industrial BOM Integrity & Placement Validator."""
 
 from .config import AppSettings, ValidationProfile
-from .core.engine import BomValidationEngine, validate_file
+from .core.engine import BomValidationEngine, validate_file, validate_sources
 from .io_excel.reader import clear_caches
 from .models import (
     BomLine,
@@ -14,6 +14,7 @@ from .models import (
     ValidationReport,
     ValidationSummary,
 )
+from .sources import SourceSet
 from .version import APP_ID, APP_NAME, ORG_NAME, __version__
 
 __all__ = [
@@ -34,5 +35,7 @@ __all__ = [
     "ValidationSummary",
     "BomValidationEngine",
     "validate_file",
+    "validate_sources",
+    "SourceSet",
     "clear_caches",
 ]

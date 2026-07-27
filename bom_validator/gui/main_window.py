@@ -47,6 +47,7 @@ from ..config import AppSettings, ValidationProfile
 from ..core.diff import diff_reports
 from ..models import Status, ValidationReport
 from ..reporting import exporters
+from ..sources import SourceError, SourceSet
 from ..storage.history import HistoryStore
 from ..version import APP_NAME, __version__
 from . import theme as th
@@ -68,6 +69,7 @@ from .models_qt import (
 )
 from .widgets.boardmap import BoardMapWidget
 from .widgets.kpi import DonutChart, KpiStrip, SparklineChart, StackedBar
+from .widgets.sources import SourcePanel
 from .workers import (
     ExportWorker,
     HistorySaveWorker,
@@ -88,6 +90,8 @@ class MainWindow(QMainWindow):
         self.placements = []
         self.previous_report: ValidationReport | None = None
         self.current_file: str = ""
+        self.sources: SourceSet | None = None
+        self._sheet_index: dict[str, tuple] = {}
         self.worker: ValidationWorker | None = None
         self.pool = QThreadPool.globalInstance()
         self.history = HistoryStore()
@@ -107,6 +111,9 @@ class MainWindow(QMainWindow):
         self.apply_theme(self.settings.theme, persist=False)
         self._restore_geometry()
         self._update_state()
+
+        self.sources_panel.set_mode(self.settings.source_mode)
+        self._on_sources_changed()
 
         if initial_file:
             QTimer.singleShot(120, lambda: self.open_file(initial_file))
@@ -130,8 +137,14 @@ class MainWindow(QMainWindow):
 
         # ---- control strip -------------------------------------------
         control = QGroupBox(tr("control_panel"))
-        cl = QHBoxLayout(control)
+        cl = QVBoxLayout(control)
         cl.setSpacing(8)
+
+        self.sources_panel = SourcePanel(tr)
+        cl.addWidget(self.sources_panel)
+
+        actions = QHBoxLayout()
+        actions.setSpacing(8)
         self.btn_open = QPushButton(tr("open"))
         self.btn_open.setMinimumHeight(34)
         self.lbl_file = QLabel(tr("no_file"))
@@ -146,12 +159,13 @@ class MainWindow(QMainWindow):
         self.btn_cancel = QPushButton(tr("cancel"))
         self.btn_cancel.setObjectName("danger")
         self.btn_cancel.setVisible(False)
-        cl.addWidget(self.btn_open)
-        cl.addWidget(self.lbl_file, 1)
-        cl.addWidget(QLabel(tr("profiles") + ":"))
-        cl.addWidget(self.cmb_profile)
-        cl.addWidget(self.btn_validate)
-        cl.addWidget(self.btn_cancel)
+        actions.addWidget(self.btn_open)
+        actions.addWidget(self.lbl_file, 1)
+        actions.addWidget(QLabel(tr("profiles") + ":"))
+        actions.addWidget(self.cmb_profile)
+        actions.addWidget(self.btn_validate)
+        actions.addWidget(self.btn_cancel)
+        cl.addLayout(actions)
         root.addWidget(control)
 
         # ---- KPI strip ------------------------------------------------
@@ -198,6 +212,8 @@ class MainWindow(QMainWindow):
         self.btn_validate.clicked.connect(self.validate)
         self.btn_cancel.clicked.connect(self.cancel_validation)
         self.cmb_profile.currentTextChanged.connect(self._on_profile_changed)
+        self.sources_panel.sources_changed.connect(self._on_sources_changed)
+        self.sources_panel.validate_requested.connect(self._on_sources_activated)
 
     def _build_results_tab(self) -> QWidget:
         tr = self.tr_
@@ -521,6 +537,7 @@ class MainWindow(QMainWindow):
     # file handling
     # ==================================================================
     def choose_file(self) -> None:
+        """Browse for the *primary* input (workbook, or the BOM in multi mode)."""
         start = self.settings.recent_files[0] if self.settings.recent_files else ""
         path, _ = QFileDialog.getOpenFileName(
             self,
@@ -532,6 +549,7 @@ class MainWindow(QMainWindow):
             self.open_file(path)
 
     def open_file(self, path: str) -> None:
+        """Open one file into the current mode's primary slot."""
         p = Path(path)
         if not p.exists():
             QMessageBox.warning(self, self.tr_("error"), f"File not found:\n{path}")
@@ -540,45 +558,102 @@ class MainWindow(QMainWindow):
             ]
             self._refresh_recent()
             return
+        if self.sources_panel.mode == "multi":
+            self.sources_panel.slot_bom.set_path(str(p))
+        else:
+            self.sources_panel.slot_workbook.set_path(str(p))
+        try:
+            selected = self.sources_panel.sources()
+        except SourceError as exc:
+            # multi mode with no placement file yet — wait for the other slots
+            self.statusBar().showMessage(str(exc))
+            return
+        self.open_sources(selected)
+
+    def open_sources(self, sources) -> None:
+        """Adopt a complete :class:`SourceSet` and refresh everything."""
+        if sources is None:
+            return
+        try:
+            sources.validate()
+        except SourceError as exc:
+            QMessageBox.warning(self, self.tr_("error"), str(exc))
+            return
         if self.report:
             self.previous_report = self.report
-        self.current_file = str(p.resolve())
-        self.lbl_file.setText(self.current_file)
-        self.settings.push_recent(self.current_file)
+        self.sources = sources
+        self.current_file = str(sources.primary)
+        self.lbl_file.setText(sources.label)
+        self.lbl_file.setToolTip("\n".join(str(p) for p in sources.paths))
+        self.settings.push_recent_sources(sources.to_dict())
         self.settings.save()
         self._refresh_recent()
         self.btn_validate.setEnabled(True)
-        self.statusBar().showMessage(f"{p.name} loaded.")
+        self.statusBar().showMessage(f"{sources.label} loaded.")
         self._populate_sheets()
         self._sync_watcher()
         if self.settings.auto_process_on_open:
             self.validate()
 
+    # -- source panel reactions -----------------------------------------
+    def _on_sources_changed(self) -> None:
+        """Enable/disable Validate as the operator fills the slots."""
+        self.btn_validate.setEnabled(
+            self.sources_panel.is_ready() and self.worker is None
+        )
+        if self.sources_panel.mode != self.settings.source_mode:
+            self.settings.source_mode = self.sources_panel.mode
+            self.settings.save()
+
+    def _on_sources_activated(self) -> None:
+        """A slot got a file — reload previews (and auto-validate if enabled)."""
+        try:
+            sources = self.sources_panel.sources()
+        except SourceError:
+            return  # incomplete selection; the panel already shows the hint
+        if sources is not None:
+            self.open_sources(sources)
+
     def reload_file(self) -> None:
-        if self.current_file:
+        if self.sources is not None:
+            self.open_sources(self.sources)
+        elif self.current_file:
             self.open_file(self.current_file)
 
     def _refresh_recent(self) -> None:
         self.menu_recent.clear()
-        for f in self.settings.recent_files:
-            a = QAction(f, self)
-            a.triggered.connect(lambda _c, path=f: self.open_file(path))
+        for entry in self.settings.recent_source_sets():
+            src = SourceSet.from_dict(entry)
+            a = QAction(src.label, self)
+            a.setToolTip("\n".join(str(p) for p in src.paths))
+            a.triggered.connect(lambda _c, s=src: self._open_recent(s))
             self.menu_recent.addAction(a)
-        if self.settings.recent_files:
+        if self.settings.recent_source_sets():
             self.menu_recent.addSeparator()
             clear = QAction("Clear list", self)
             clear.triggered.connect(self._clear_recent)
             self.menu_recent.addAction(clear)
 
+    def _open_recent(self, src) -> None:
+        """Restore a recent entry — including its three-file layout."""
+        self.sources_panel.set_sources(src)
+        self.open_sources(src)
+
     def _clear_recent(self) -> None:
         self.settings.recent_files = []
+        self.settings.recent_sources = []
         self.settings.save()
         self._refresh_recent()
 
     def _sync_watcher(self) -> None:
         for f in self.watcher.files():
             self.watcher.removePath(f)
-        if self.settings.watch_files and self.current_file:
+        if not self.settings.watch_files:
+            return
+        if self.sources is not None:
+            for p in self.sources.paths:
+                self.watcher.addPath(str(p))
+        elif self.current_file:
             self.watcher.addPath(self.current_file)
 
     def toggle_watch(self, checked: bool) -> None:
@@ -599,9 +674,19 @@ class MainWindow(QMainWindow):
     # validation
     # ==================================================================
     def validate(self) -> None:
-        if not self.current_file:
+        try:
+            selected = self.sources_panel.sources()
+        except SourceError as exc:
+            QMessageBox.warning(self, self.tr_("error"), str(exc))
+            return
+        if selected is None:
             self.choose_file()
             return
+        if selected != self.sources:
+            # the operator changed a slot without re-opening — adopt it
+            self.sources = selected
+            self.current_file = str(selected.primary)
+            self.lbl_file.setText(selected.label)
         if self.worker is not None:
             return
         self.progress.setVisible(True)
@@ -611,7 +696,7 @@ class MainWindow(QMainWindow):
         self.btn_cancel.setVisible(True)
         self.statusBar().showMessage(self.tr_("processing"))
 
-        self.worker = ValidationWorker(self.current_file, self.profile)
+        self.worker = ValidationWorker(self.sources or self.current_file, self.profile)
         self.worker.signals.progress.connect(self._on_progress)
         self.worker.signals.finished.connect(self._on_finished)
         self.worker.signals.failed.connect(self._on_failed)
@@ -667,7 +752,7 @@ class MainWindow(QMainWindow):
     def _teardown_progress(self) -> None:
         self.progress.setVisible(False)
         self.btn_cancel.setVisible(False)
-        self.btn_validate.setEnabled(bool(self.current_file))
+        self.btn_validate.setEnabled(self.sources_panel.is_ready())
         self._update_state()
 
     # ==================================================================
@@ -755,7 +840,7 @@ class MainWindow(QMainWindow):
         )
         self.summary_html.setHtml(
             f"""
-            <h3>{Path(r.source_file).name}</h3>
+            <h3>{r.source_label}</h3>
             <p style='color:#888'>profile <b>{r.profile_name}</b> ·
             sha256 <code>{r.source_sha256[:20]}…</code> ·
             {r.generated_at:%Y-%m-%d %H:%M:%S} UTC</p>
@@ -913,46 +998,53 @@ class MainWindow(QMainWindow):
     # preview & mapping
     # ==================================================================
     def _populate_sheets(self) -> None:
-        """Parse the workbook on a worker thread; the UI stays responsive."""
+        """Parse the selected input(s) on a worker thread; the UI stays responsive."""
         self.cmb_sheet.blockSignals(True)
         self.cmb_sheet.clear()
         self.cmb_sheet.blockSignals(False)
-        self._loader = None
+        self._sheet_index = {}
         self.preview_model.set_sheet([], -1, {})
         self.lbl_mapping.setText("loading…")
 
-        target = self.current_file
+        target = self.sources or SourceSet.single(self.current_file)
         worker = WorkbookLoadWorker(target)
         worker.signals.finished.connect(
-            lambda loader, names, f=target: self._on_workbook_loaded(f, loader, names)
+            lambda index, labels, t=target: self._on_workbook_loaded(t, index, labels)
         )
         worker.signals.failed.connect(self._on_workbook_load_failed)
         self.pool.start(worker)
 
-    @pyqtSlot(object, list)
-    def _on_workbook_loaded(self, file_path: str, loader, names: list) -> None:
-        if file_path != self.current_file:
-            return  # a newer file was opened while we were parsing
-        self._loader = loader
+    def _on_workbook_loaded(self, sources, index, labels: list) -> None:
+        current = self.sources or (
+            SourceSet.single(self.current_file) if self.current_file else None
+        )
+        if SourceSet.coerce(sources) != current:
+            return  # a newer selection was opened while we were parsing
+        self._sheet_index = index
         self.cmb_sheet.blockSignals(True)
         self.cmb_sheet.clear()
-        self.cmb_sheet.addItems(names)
+        self.cmb_sheet.addItems(labels)
         self.cmb_sheet.blockSignals(False)
         self._load_preview()
 
     @pyqtSlot(str)
     def _on_workbook_load_failed(self, message: str) -> None:
         log.warning("preview load failed: %s", message)
-        self._loader = None
+        self._sheet_index = {}
         self.lbl_mapping.setText(message)
 
+    def _current_sheet(self):
+        """(sheet, sheet_name) for the sheet selected in the preview tab."""
+        index = getattr(self, "_sheet_index", None) or {}
+        entry = index.get(self.cmb_sheet.currentText())
+        if not entry:
+            return None, ""
+        loader, name = entry
+        return loader.get(name), name
+
     def _load_preview(self) -> None:
-        loader = getattr(self, "_loader", None)
-        name = self.cmb_sheet.currentText()
-        if not loader or not name:
-            return
-        sheet = loader.get(name)
-        if not sheet:
+        sheet, _name = self._current_sheet()
+        if sheet is None:
             return
         from ..io_excel import reader as rd
 
@@ -966,16 +1058,13 @@ class MainWindow(QMainWindow):
         self.preview_view.resizeColumnsToContents()
 
     def _edit_mapping(self) -> None:
-        loader = getattr(self, "_loader", None)
-        if not loader:
+        sheet, name = self._current_sheet()
+        if sheet is None:
             QMessageBox.information(self, self.tr_("info"), "Open a workbook first.")
             return
         from ..io_excel import reader as rd
 
-        name = self.cmb_sheet.currentText()
-        sheet = loader.get(name)
         mapping = rd.detect_header(sheet, self.profile)
-        headers = []
         if mapping.header_row >= 0:
             row = sheet.rows[mapping.header_row]
             headers = [str(v) if v is not None else "" for v in row]
@@ -1166,6 +1255,7 @@ class MainWindow(QMainWindow):
             "Language changed. Some labels update after restart.",
         )
         self.kpi.retranslate(self.tr_)
+        self.sources_panel.retranslate(self.tr_)
         self.btn_open.setText(self.tr_("open"))
         self.btn_validate.setText(self.tr_("process"))
         self.btn_cancel.setText(self.tr_("cancel"))

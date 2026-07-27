@@ -272,7 +272,11 @@ class AppSettings:
     language: str = "fa"
     last_profile: str = "default"
     recent_files: list[str] = field(default_factory=list)
+    # richer history that remembers three-file selections; recent_files stays
+    # in sync so older settings files (and code paths) keep working
+    recent_sources: list[dict[str, str]] = field(default_factory=list)
     max_recent: int = 12
+    source_mode: str = "single"  # "single" | "multi"
     auto_process_on_open: bool = True
     watch_files: bool = False
     font_size: int = 9
@@ -292,6 +296,29 @@ class AppSettings:
             self.recent_files.remove(p)
         self.recent_files.insert(0, p)
         del self.recent_files[self.max_recent :]
+
+    def push_recent_sources(self, entry: dict[str, str]) -> None:
+        """Remember a whole input selection (single file or BOM+top+bot)."""
+        norm = {
+            "mode": entry.get("mode", "single"),
+            "bom": str(Path(entry["bom"]).resolve()),
+            "top": str(Path(entry["top"]).resolve()) if entry.get("top") else "",
+            "bot": str(Path(entry["bot"]).resolve()) if entry.get("bot") else "",
+        }
+        self.recent_sources = [e for e in self.recent_sources if e != norm]
+        self.recent_sources.insert(0, norm)
+        del self.recent_sources[self.max_recent :]
+        self.source_mode = norm["mode"]
+        self.push_recent(norm["bom"])
+
+    def recent_source_sets(self) -> list[dict[str, str]]:
+        """Recent selections, back-filled from the legacy ``recent_files``."""
+        out = list(self.recent_sources)
+        known = {e["bom"] for e in out}
+        for f in self.recent_files:
+            if f not in known:
+                out.append({"mode": "single", "bom": f, "top": "", "bot": ""})
+        return out[: self.max_recent]
 
     def save(self) -> Path:
         self.path.write_text(

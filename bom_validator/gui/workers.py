@@ -11,6 +11,7 @@ from ..config import ValidationProfile
 from ..core.engine import BomValidationEngine, ValidationCancelled
 from ..io_excel import reader as rd
 from ..models import Layer, Placement, ValidationReport
+from ..sources import SourceSet
 
 
 class WorkerSignals(QObject):
@@ -21,11 +22,16 @@ class WorkerSignals(QObject):
 
 
 class ValidationWorker(QRunnable):
-    """Runs one validation on the global thread pool."""
+    """Runs one validation on the global thread pool.
 
-    def __init__(self, file_path: str, profile: ValidationProfile):
+    Accepts either a single path or a :class:`~bom_validator.sources.SourceSet`
+    describing the BOM plus separate top/bot files.
+    """
+
+    def __init__(self, file_path: str | SourceSet, profile: ValidationProfile):
         super().__init__()
-        self.file_path = file_path
+        self.sources = SourceSet.coerce(file_path)
+        self.file_path = str(self.sources.primary)
         self.profile = profile
         self.signals = WorkerSignals()
         self._cancelled = False
@@ -38,7 +44,7 @@ class ValidationWorker(QRunnable):
         try:
             engine = BomValidationEngine(self.profile)
             report = engine.run(
-                self.file_path,
+                self.sources,
                 progress=lambda d, t, m: self.signals.progress.emit(d, t, m),
                 cancel=lambda: self._cancelled,
             )
@@ -56,9 +62,22 @@ class ValidationWorker(QRunnable):
     def _collect_placements(self) -> list[Placement]:
         """Fallback placement read (grids come from the shared workbook cache)."""
         try:
+            out: list[Placement] = []
+            if self.sources.is_multi:
+                for file_path, layer in (
+                    (self.sources.top, Layer.TOP),
+                    (self.sources.bot, Layer.BOT),
+                ):
+                    if file_path is None:
+                        continue
+                    loader = rd.WorkbookLoader(file_path)
+                    for name in loader.sheet_names():
+                        out += rd.extract_placements(
+                            loader.sheets[name], layer, self.profile
+                        )
+                return out
             loader = rd.WorkbookLoader(self.file_path)
             buckets = rd.classify_sheets(loader.sheet_names(), self.profile)
-            out: list[Placement] = []
             for name in buckets["top"]:
                 out += rd.extract_placements(loader.sheets[name], Layer.TOP, self.profile)
             for name in buckets["bot"]:
@@ -69,28 +88,37 @@ class ValidationWorker(QRunnable):
 
 
 class LoadSignals(QObject):
-    finished = pyqtSignal(object, list)  # loader, sheet names
+    finished = pyqtSignal(object, list)  # {label: (loader, sheet)}, labels
     failed = pyqtSignal(str)
 
 
 class WorkbookLoadWorker(QRunnable):
-    """Parses a workbook off the UI thread so opening a file never blocks.
+    """Parses the selected input(s) off the UI thread so opening never blocks.
 
     The parsed grids land in the shared loader cache, so the validation run
-    that usually follows costs nothing extra.
+    that usually follows costs nothing extra. In three-file mode every file is
+    parsed and its sheets are exposed as ``file.xlsx › sheet`` entries.
     """
 
-    def __init__(self, file_path: str):
+    def __init__(self, file_path: str | SourceSet):
         super().__init__()
-        self.file_path = file_path
+        self.sources = SourceSet.coerce(file_path)
+        self.file_path = str(self.sources.primary)
         self.signals = LoadSignals()
 
     @pyqtSlot()
     def run(self) -> None:  # noqa: D102
         try:
-            loader = rd.WorkbookLoader(self.file_path)
-            names = loader.sheet_names()  # forces the parse
-            self.signals.finished.emit(loader, names)
+            index: dict[str, tuple] = {}
+            labels: list[str] = []
+            multi = self.sources.is_multi
+            for path in self.sources.paths:
+                loader = rd.WorkbookLoader(path)
+                for name in loader.sheet_names():  # forces the parse
+                    label = f"{Path(path).name} › {name}" if multi else name
+                    index[label] = (loader, name)
+                    labels.append(label)
+            self.signals.finished.emit(index, labels)
         except Exception as exc:
             self.signals.failed.emit(f"{type(exc).__name__}: {exc}")
 

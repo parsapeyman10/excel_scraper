@@ -433,7 +433,7 @@ class TestWindowAsyncLoading:
 
         w = MainWindow()
         w.current_file = "/some/other/file.xlsx"
-        w._on_workbook_loaded("/an/older/file.xlsx", object(), ["ghost"])
+        w._on_workbook_loaded("/an/older/file.xlsx", {}, ["ghost"])
         assert w.cmb_sheet.count() == 0
         w.close()
 
@@ -488,4 +488,159 @@ class TestAsyncDiff:
         w.compare_revision()
         assert _drain(qapp, lambda: bool(shown))
         assert "file.xlsx" in shown[0].lower()
+        w.close()
+
+
+class TestSourcePanel:
+    def _panel(self):
+        from bom_validator.gui.widgets.sources import SourcePanel
+
+        return SourcePanel(Translator("en"))
+
+    def test_starts_in_single_mode_and_empty(self, qapp):
+        p = self._panel()
+        assert p.mode == "single"
+        assert p.sources() is None
+        assert not p.is_ready()
+
+    def test_single_mode_selection(self, qapp, make_workbook):
+        p = self._panel()
+        f = make_workbook()
+        p.slot_workbook.set_path(str(f))
+        src = p.sources()
+        assert src is not None and not src.is_multi
+        assert src.primary == f.resolve()
+        assert p.is_ready()
+
+    def test_multi_mode_needs_a_placement_file(self, qapp, make_split_workbooks):
+        from bom_validator.sources import SourceError
+
+        bom, _top, _bot = make_split_workbooks()
+        p = self._panel()
+        p.set_mode("multi")
+        p.slot_bom.set_path(str(bom))
+        with pytest.raises(SourceError):
+            p.sources()
+        assert not p.is_ready()
+
+    def test_multi_mode_three_slots(self, qapp, make_split_workbooks):
+        bom, top, bot = make_split_workbooks()
+        p = self._panel()
+        p.set_mode("multi")
+        p.slot_bom.set_path(str(bom))
+        p.slot_top.set_path(str(top))
+        p.slot_bot.set_path(str(bot))
+        src = p.sources()
+        assert src.is_multi
+        assert src.top == top.resolve() and src.bot == bot.resolve()
+        assert p.is_ready()
+
+    def test_switching_mode_keeps_each_selection(self, qapp, make_workbook,
+                                                 make_split_workbooks):
+        bom, top, _ = make_split_workbooks()
+        single = make_workbook()
+        p = self._panel()
+        p.slot_workbook.set_path(str(single))
+        p.set_mode("multi")
+        p.slot_bom.set_path(str(bom))
+        p.slot_top.set_path(str(top))
+        assert p.sources().is_multi
+        p.set_mode("single")
+        assert p.sources().primary == single.resolve()
+
+    def test_clearing_an_optional_slot(self, qapp, make_split_workbooks):
+        bom, top, bot = make_split_workbooks()
+        p = self._panel()
+        p.set_mode("multi")
+        p.slot_bom.set_path(str(bom))
+        p.slot_top.set_path(str(top))
+        p.slot_bot.set_path(str(bot))
+        p.slot_bot.clear()
+        assert p.sources().bot is None
+
+    def test_set_sources_restores_the_layout(self, qapp, make_split_workbooks):
+        from bom_validator.sources import SourceSet
+
+        bom, top, bot = make_split_workbooks()
+        p = self._panel()
+        p.set_sources(SourceSet.multi(bom, top, bot))
+        assert p.mode == "multi"
+        assert p.stack.currentIndex() == 1
+        assert p.sources().bot == bot.resolve()
+
+    def test_hint_only_shows_problems(self, qapp, make_split_workbooks):
+        bom, top, bot = make_split_workbooks()
+        p = self._panel()
+        p.set_mode("multi")
+        p.slot_bom.set_path(str(bom))
+        # BOM only → the panel must explain what is still missing
+        assert "placement file" in p.lbl_hint.text()
+        assert p.lbl_hint.isVisible() or not p.isVisible()
+        p.slot_top.set_path(str(top))
+        p.slot_bot.set_path(str(bot))
+        assert p.lbl_hint.text() == ""
+
+
+class TestMainWindowThreeFiles:
+    def test_validates_split_files(self, qapp, make_split_workbooks):
+        from bom_validator.gui.main_window import MainWindow
+        from bom_validator.sources import SourceSet
+
+        bom, top, bot = make_split_workbooks()
+        w = MainWindow()
+        w.sources_panel.set_sources(SourceSet.multi(bom, top, bot))
+        w.open_sources(w.sources_panel.sources())
+        assert _drain(qapp, lambda: w.report is not None)
+        assert w.report.summary.top_placed == 4
+        assert w.report.summary.bot_placed == 2
+        assert w.report.metadata["source_mode"] == "multi"
+        w.close()
+
+    def test_preview_lists_sheets_of_every_file(self, qapp, make_split_workbooks):
+        from bom_validator.gui.main_window import MainWindow
+        from bom_validator.sources import SourceSet
+
+        bom, top, bot = make_split_workbooks()
+        w = MainWindow()
+        w.sources_panel.set_sources(SourceSet.multi(bom, top, bot))
+        w.open_sources(w.sources_panel.sources())
+        assert _drain(qapp, lambda: w.cmb_sheet.count() >= 3)
+        labels = [w.cmb_sheet.itemText(i) for i in range(w.cmb_sheet.count())]
+        assert any("top_export.xlsx" in x for x in labels)
+        assert any("bot_export.xlsx" in x for x in labels)
+        w.close()
+
+    def test_single_mode_still_works(self, qapp, make_workbook):
+        from bom_validator.gui.main_window import MainWindow
+
+        w = MainWindow()
+        w.open_file(str(make_workbook()))
+        assert _drain(qapp, lambda: w.report is not None)
+        assert w.report.metadata["source_mode"] == "single"
+        assert w.cmb_sheet.count() == 3
+        w.close()
+
+    def test_open_file_fills_the_bom_slot_in_multi_mode(self, qapp, make_split_workbooks):
+        from bom_validator.gui.main_window import MainWindow
+
+        bom, _top, _bot = make_split_workbooks()
+        w = MainWindow()
+        w.sources_panel.set_mode("multi")
+        w.open_file(str(bom))  # incomplete: no placement file yet
+        assert w.sources_panel.slot_bom.path() == str(bom.resolve())
+        assert w.report is None
+        assert "placement file" in w.statusBar().currentMessage()
+        w.close()
+
+    def test_recent_menu_restores_a_three_file_entry(self, qapp, make_split_workbooks):
+        from bom_validator.gui.main_window import MainWindow
+        from bom_validator.sources import SourceSet
+
+        bom, top, bot = make_split_workbooks()
+        w = MainWindow()
+        w.sources_panel.set_sources(SourceSet.multi(bom, top, bot))
+        w.open_sources(w.sources_panel.sources())
+        assert _drain(qapp, lambda: w.report is not None)
+        labels = [a.text() for a in w.menu_recent.actions()]
+        assert any("TOP:top_export.xlsx" in x for x in labels)
         w.close()
