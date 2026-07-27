@@ -1,0 +1,62 @@
+name: tests
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install Qt runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgl1 libegl1 libxkbcommon-x11-0 libdbus-1-3 \
+            libxcb-icccm4 libxcb-image0 libxcb-keysyms1 \
+            libxcb-randr0 libxcb-render-util0 libxcb-shape0 libxcb-xinerama0
+
+      - name: Install package
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,all]"
+
+      - name: Lint
+        run: ruff check bom_validator tests
+
+      - name: Test
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: pytest --cov=bom_validator --cov-report=term-missing
+
+      - name: Validate the sample workbook end to end
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          python -m bom_validator validate BOM_TOP_BOT_Component_Deffine.xlsx \
+            --no-history --no-color --fail-on never \
+            -r html:artifacts/report.html \
+            -r xlsx:artifacts/report.xlsx \
+            -r junit:artifacts/results.xml
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reports-py${{ matrix.python-version }}
+          path: artifacts/
+          if-no-files-found: ignore
