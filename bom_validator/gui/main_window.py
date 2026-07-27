@@ -68,7 +68,12 @@ from .models_qt import (
 )
 from .widgets.boardmap import BoardMapWidget
 from .widgets.kpi import DonutChart, KpiStrip, SparklineChart, StackedBar
-from .workers import ExportWorker, ValidationWorker
+from .workers import (
+    ExportWorker,
+    HistorySaveWorker,
+    ValidationWorker,
+    WorkbookLoadWorker,
+)
 
 log = logging.getLogger(__name__)
 
@@ -99,7 +104,7 @@ class MainWindow(QMainWindow):
         self._build_actions()
         self._build_menu()
         self._build_toolbar()
-        self.apply_theme(self.settings.theme)
+        self.apply_theme(self.settings.theme, persist=False)
         self._restore_geometry()
         self._update_state()
 
@@ -246,12 +251,23 @@ class MainWindow(QMainWindow):
         header.setSectionsMovable(True)
         header.setTextElideMode(Qt.TextElideMode.ElideRight)
         self.table.setWordWrap(False)
+        # uniform row heights let Qt skip per-row size hints entirely
+        self.table.verticalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Fixed
+        )
         self.table.setHorizontalScrollMode(
             QAbstractItemView.ScrollMode.ScrollPerPixel
         )
         lay.addWidget(self.table, 1)
 
-        self.txt_search.textChanged.connect(self.proxy.set_text)
+        # debounce typing: re-filtering on every keystroke stutters on big BOMs
+        self._search_debounce = QTimer(self)
+        self._search_debounce.setSingleShot(True)
+        self._search_debounce.setInterval(140)
+        self._search_debounce.timeout.connect(
+            lambda: self.proxy.set_text(self.txt_search.text())
+        )
+        self.txt_search.textChanged.connect(lambda _t: self._search_debounce.start())
         self.cmb_status.currentIndexChanged.connect(
             lambda: self.proxy.set_status_filter([self.cmb_status.currentData()])
         )
@@ -305,6 +321,7 @@ class MainWindow(QMainWindow):
         self.desig_proxy = QSortFilterProxyModel(self)
         self.desig_proxy.setSourceModel(self.desig_model)
         self.desig_proxy.setFilterKeyColumn(-1)
+        self.desig_proxy.setDynamicSortFilter(True)
         self.desig_proxy.setFilterCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
         self.desig_view = QTableView()
         self.desig_view.setModel(self.desig_proxy)
@@ -618,10 +635,11 @@ class MainWindow(QMainWindow):
         self.placements = placements or []
         self._teardown_progress()
         self._render_report()
-        try:
-            self.history.save(report, operator=os.environ.get("USERNAME", ""))
-        except Exception as exc:
-            log.warning("history save failed: %s", exc)
+        saver = HistorySaveWorker(
+            self.history, report, os.environ.get("USERNAME", "") or os.environ.get("USER", "")
+        )
+        saver.signals.failed.connect(lambda m: log.warning("history save failed: %s", m))
+        self.pool.start(saver)
         s = report.summary
         self.statusBar().showMessage(
             f"{self.tr_('done')}  {s.total_lines} lines · {s.passed} pass · "
@@ -675,7 +693,6 @@ class MainWindow(QMainWindow):
                 f"{r.mapping.header_row + 1} · conf {r.mapping.confidence:.0%} · "
                 f"{r.duration_ms:.0f} ms"
             )
-        self.table.resizeRowsToContents()
         for i, (_k, _l, wpx) in enumerate(ResultTableModel.COLUMNS):
             if self.table.columnWidth(i) < 30:
                 self.table.setColumnWidth(i, wpx)
@@ -896,18 +913,38 @@ class MainWindow(QMainWindow):
     # preview & mapping
     # ==================================================================
     def _populate_sheets(self) -> None:
+        """Parse the workbook on a worker thread; the UI stays responsive."""
         self.cmb_sheet.blockSignals(True)
         self.cmb_sheet.clear()
-        try:
-            from ..io_excel import reader as rd
+        self.cmb_sheet.blockSignals(False)
+        self._loader = None
+        self.preview_model.set_sheet([], -1, {})
+        self.lbl_mapping.setText("loading…")
 
-            self._loader = rd.WorkbookLoader(self.current_file)
-            self.cmb_sheet.addItems(self._loader.sheet_names())
-        except Exception as exc:
-            log.warning("preview load failed: %s", exc)
-            self._loader = None
+        target = self.current_file
+        worker = WorkbookLoadWorker(target)
+        worker.signals.finished.connect(
+            lambda loader, names, f=target: self._on_workbook_loaded(f, loader, names)
+        )
+        worker.signals.failed.connect(self._on_workbook_load_failed)
+        self.pool.start(worker)
+
+    @pyqtSlot(object, list)
+    def _on_workbook_loaded(self, file_path: str, loader, names: list) -> None:
+        if file_path != self.current_file:
+            return  # a newer file was opened while we were parsing
+        self._loader = loader
+        self.cmb_sheet.blockSignals(True)
+        self.cmb_sheet.clear()
+        self.cmb_sheet.addItems(names)
         self.cmb_sheet.blockSignals(False)
         self._load_preview()
+
+    @pyqtSlot(str)
+    def _on_workbook_load_failed(self, message: str) -> None:
+        log.warning("preview load failed: %s", message)
+        self._loader = None
+        self.lbl_mapping.setText(message)
 
     def _load_preview(self) -> None:
         loader = getattr(self, "_loader", None)
@@ -1011,14 +1048,29 @@ class MainWindow(QMainWindow):
         )
         if not path:
             return
-        try:
-            from ..core.engine import validate_file
+        # validating the other revision can take seconds — do it on a worker
+        self.statusBar().showMessage(f"Comparing with {Path(path).name}…")
+        self.progress.setVisible(True)
+        self.progress.setRange(0, 0)  # busy indicator
+        worker = ValidationWorker(path, self.profile)
+        worker.signals.finished.connect(lambda other, _p: self._show_diff(other))
+        worker.signals.failed.connect(self._on_diff_failed)
+        self.pool.start(worker)
 
-            other = validate_file(path, self.profile)
-        except Exception as exc:
-            QMessageBox.critical(self, self.tr_("error"), str(exc))
+    @pyqtSlot(str, str)
+    def _on_diff_failed(self, message: str, tb: str) -> None:
+        self.progress.setVisible(False)
+        self.progress.setRange(0, 100)
+        self.statusBar().showMessage("Comparison failed.")
+        QMessageBox.critical(self, self.tr_("error"), message)
+
+    def _show_diff(self, other: ValidationReport) -> None:
+        self.progress.setVisible(False)
+        self.progress.setRange(0, 100)
+        if not self.report:
             return
         d = diff_reports(other, self.report)
+        self.statusBar().showMessage(f"{d.total_changes} change(s) found.")
         from PyQt6.QtWidgets import QDialog, QDialogButtonBox
         from PyQt6.QtWidgets import QVBoxLayout as VB
 
@@ -1073,9 +1125,13 @@ class MainWindow(QMainWindow):
     # ==================================================================
     # appearance
     # ==================================================================
-    def apply_theme(self, name: str) -> None:
+    def apply_theme(self, name: str, *, persist: bool = True) -> None:
+        if name == getattr(self, "_applied_theme", None):
+            return  # nothing changed — skip a full restyle of every widget
+        self._applied_theme = name
         self.settings.theme = name
-        self.settings.save()
+        if persist:
+            self.settings.save()
         self.setStyleSheet(th.stylesheet(name))
         self.model.set_theme(name)
         self.kpi.set_theme(name)

@@ -44,16 +44,58 @@ class ResultTableModel(QAbstractTableModel):
         self.theme = theme
         self._rows: list[LineResult] = []
         self._colors = th.status_colors(theme)
+        self._keys = [c[0] for c in self.COLUMNS]
+        self._findings: list[str] = []      # pre-joined issue text per row
+        self._search: list[str] = []        # lowercase haystack per row
+        self._rebuild_brushes()
+
+    def _rebuild_brushes(self) -> None:
+        """Brushes and fonts are shared, not re-allocated for every cell."""
+        self._brush_bg = {
+            k: QBrush(QColor(v[0])) for k, v in self._colors.items()
+        }
+        self._brush_fg = {
+            k: QBrush(QColor(v[1])) for k, v in self._colors.items()
+        }
+        bold = QFont()
+        bold.setBold(True)
+        mono = QFont()
+        mono.setFamily("Consolas, monospace")
+        self._font_status = bold
+        self._font_stock = mono
 
     # -- data plumbing -------------------------------------------------
     def set_report(self, report: ValidationReport | None) -> None:
         self.beginResetModel()
         self._rows = list(report.results) if report else []
+        # Pre-compute the two strings that would otherwise be rebuilt on every
+        # repaint / filter pass. This is what makes scrolling and typing in the
+        # search box instant on a 10k-line BOM.
+        self._findings = [" • ".join(i.message for i in r.issues) for r in self._rows]
+        self._search = [self._haystack(n, r) for n, r in enumerate(self._rows)]
         self.endResetModel()
+
+    def _haystack(self, n: int, r: LineResult) -> str:
+        return " ".join(
+            (
+                r.line.item,
+                r.line.stock_no,
+                r.line.part_name,
+                r.line.size,
+                r.line.brand,
+                r.status.value,
+                self._findings[n],
+                r.operator_note,
+            )
+        ).lower()
+
+    def search_text(self, row: int) -> str:
+        return self._search[row] if 0 <= row < len(self._search) else ""
 
     def set_theme(self, theme: str) -> None:
         self.theme = theme
         self._colors = th.status_colors(theme)
+        self._rebuild_brushes()
         if self._rows:
             self.dataChanged.emit(
                 self.index(0, 0),
@@ -90,55 +132,77 @@ class ResultTableModel(QAbstractTableModel):
     def data(self, index: QModelIndex, role=Qt.ItemDataRole.DisplayRole) -> Any:
         if not index.isValid():
             return None
-        r = self._rows[index.row()]
-        key = self.COLUMNS[index.column()][0]
+        row = index.row()
+        r = self._rows[row]
+        key = self._keys[index.column()]
 
-        if role == Qt.ItemDataRole.CheckStateRole and key == "select":
-            return CHECK.Checked if r.signed_off else CHECK.Unchecked
+        if role == Qt.ItemDataRole.CheckStateRole:
+            return (
+                (CHECK.Checked if r.signed_off else CHECK.Unchecked)
+                if key == "select"
+                else None
+            )
 
         if role in (Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.EditRole):
-            return {
-                "select": "",
-                "item": r.line.item,
-                "stock": r.line.stock_no,
-                "part": r.line.part_name,
-                "size": r.line.size,
-                "brand": r.line.brand,
-                "top": r.top_count,
-                "bot": r.bot_count,
-                "placed": r.placed_total,
-                "delta": f"{r.delta:+d}" if r.delta else "0",
-                "status": r.status.value,
-                "findings": " • ".join(i.message for i in r.issues),
-                "note": r.operator_note,
-            }.get(key, "")
+            # explicit branches instead of building a dict for every cell
+            if key == "part":
+                return r.line.part_name
+            if key == "stock":
+                return r.line.stock_no
+            if key == "status":
+                return r.status.value
+            if key == "findings":
+                return self._findings[row]
+            if key == "top":
+                return r.top_count
+            if key == "bot":
+                return r.bot_count
+            if key == "placed":
+                return r.placed_total
+            if key == "delta":
+                d = r.delta
+                return f"{d:+d}" if d else "0"
+            if key == "item":
+                return r.line.item
+            if key == "size":
+                return r.line.size
+            if key == "brand":
+                return r.line.brand
+            if key == "note":
+                return r.operator_note
+            return ""
 
         if role == Qt.ItemDataRole.UserRole:  # sorting payload
-            return {
-                "top": r.top_count,
-                "bot": r.bot_count,
-                "placed": r.placed_total,
-                "delta": r.delta,
-                "status": -r.status.severity,
-                "item": r.line.source_row,
-            }.get(key, self.data(index, Qt.ItemDataRole.DisplayRole))
+            if key == "top":
+                return r.top_count
+            if key == "bot":
+                return r.bot_count
+            if key == "placed":
+                return r.placed_total
+            if key == "delta":
+                return r.delta
+            if key == "status":
+                return -r.status.severity
+            if key == "item":
+                return r.line.source_row
+            return self.data(index, Qt.ItemDataRole.DisplayRole)
 
         if role == Qt.ItemDataRole.UserRole + 1:  # status for proxy filtering
             return r.status.value
+        if role == Qt.ItemDataRole.UserRole + 2:  # pre-built search haystack
+            return self._search[row]
 
-        bg, fg = self._colors.get(r.status.value, ("#FFFFFF", "#000000"))
+        status = r.status.value
         if role == Qt.ItemDataRole.BackgroundRole:
-            return QBrush(QColor(bg))
+            return self._brush_bg.get(status)
         if role == Qt.ItemDataRole.ForegroundRole:
-            if key in ("status", "delta"):
-                return QBrush(QColor(fg))
-            return None
-        if role == Qt.ItemDataRole.FontRole and key in ("status", "stock"):
-            f = QFont()
-            f.setBold(key == "status")
+            return self._brush_fg.get(status) if key in ("status", "delta") else None
+        if role == Qt.ItemDataRole.FontRole:
+            if key == "status":
+                return self._font_status
             if key == "stock":
-                f.setFamily("Consolas, monospace")
-            return f
+                return self._font_stock
+            return None
         if role == Qt.ItemDataRole.TextAlignmentRole:
             if key in ("part", "findings", "note", "brand"):
                 return int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
@@ -179,6 +243,8 @@ class ResultTableModel(QAbstractTableModel):
             return True
         if role == Qt.ItemDataRole.EditRole and key == "note":
             r.operator_note = str(value)
+            if 0 <= index.row() < len(self._search):
+                self._search[index.row()] = self._haystack(index.row(), r)
             self.dataChanged.emit(index, index, [role])
             return True
         return False
@@ -206,6 +272,7 @@ class ResultFilterProxy(QSortFilterProxyModel):
         self._status: set[str] = set()
         self._only_failing = False
         self._text = ""
+        self._tokens: tuple[str, ...] = ()
 
     def set_status_filter(self, statuses: Sequence[str]) -> None:
         self._status = {s for s in statuses if s}
@@ -216,7 +283,12 @@ class ResultFilterProxy(QSortFilterProxyModel):
         self.invalidateFilter()
 
     def set_text(self, text: str) -> None:
-        self._text = text.strip().lower()
+        """Space separated terms are AND-ed, which is what operators expect."""
+        new = text.strip().lower()
+        if new == self._text:
+            return
+        self._text = new
+        self._tokens = tuple(t for t in new.split() if t)
         self.invalidateFilter()
 
     def filterAcceptsRow(self, row: int, parent: QModelIndex) -> bool:
@@ -229,6 +301,10 @@ class ResultFilterProxy(QSortFilterProxyModel):
         if self._status and status not in self._status:
             return False
         if self._text:
+            # a single pre-lowercased haystack beats scanning 13 columns
+            hay = model.index(row, 0, parent).data(Qt.ItemDataRole.UserRole + 2)
+            if hay is not None:
+                return all(tok in hay for tok in self._tokens)
             for c in range(model.columnCount()):
                 v = model.index(row, c, parent).data(Qt.ItemDataRole.DisplayRole)
                 if v is not None and self._text in str(v).lower():

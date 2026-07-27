@@ -136,14 +136,21 @@ class BoardCanvas(QWidget):
         sy = (self.height() - 2 * margin) / self._bounds.height()
         return min(sx, sy) * self._zoom
 
-    def _to_screen(self, x: float, y: float) -> QPointF:
+    def _transform(self) -> tuple[float, float, float, float, float]:
+        """(scale, cx, cy, bx, by) — computed once per paint, not per marker."""
         s = self._scale()
-        cx = self.width() / 2 + self._pan.x()
-        cy = self.height() / 2 + self._pan.y()
-        return QPointF(
-            cx + (x - self._bounds.center().x()) * s,
-            cy - (y - self._bounds.center().y()) * s,  # Y up, like a PCB
+        centre = self._bounds.center()
+        return (
+            s,
+            self.width() / 2 + self._pan.x(),
+            self.height() / 2 + self._pan.y(),
+            centre.x(),
+            centre.y(),
         )
+
+    def _to_screen(self, x: float, y: float) -> QPointF:
+        s, cx, cy, bx, by = self._transform()
+        return QPointF(cx + (x - bx) * s, cy - (y - by) * s)  # Y up, like a PCB
 
     def _visible(self, m: Marker) -> bool:
         if m.placement.layer is Layer.TOP and not self._show_top:
@@ -195,11 +202,15 @@ class BoardCanvas(QWidget):
 
     def _hit_test(self, pos: QPointF) -> Marker | None:
         best, best_d = None, 9.0
+        s, cx, cy, bx, by = self._transform()
+        px, py = pos.x(), pos.y()
         for m in self._markers:
             if not self._visible(m):
                 continue
-            sp = self._to_screen(m.placement.x or 0, m.placement.y or 0)
-            d = (sp - pos).manhattanLength()
+            pl = m.placement
+            d = abs(cx + ((pl.x or 0) - bx) * s - px) + abs(
+                cy - ((pl.y or 0) - by) * s - py
+            )
             if d < best_d:
                 best, best_d = m, d
         return best
@@ -251,26 +262,35 @@ class BoardCanvas(QWidget):
         painter.setFont(font)
 
         shown = 0
+        sc, cx, cy, bx, by = self._transform()
+        clip = self.rect().adjusted(-40, -40, 40, 40)
+        clip_l, clip_t = clip.left(), clip.top()
+        clip_r, clip_b = clip.right(), clip.bottom()
+        highlight = self._highlight
         for m in self._markers:
             if not self._visible(m):
                 continue
             shown += 1
-            sp = self._to_screen(m.placement.x or 0, m.placement.y or 0)
-            if not self.rect().adjusted(-40, -40, 40, 40).contains(sp.toPoint()):
+            pl = m.placement
+            spx = cx + ((pl.x or 0) - bx) * sc
+            spy = cy - ((pl.y or 0) - by) * sc
+            # cheap scalar cull before allocating a QPointF
+            if not (clip_l <= spx <= clip_r and clip_t <= spy <= clip_b):
                 continue
+            sp = QPointF(spx, spy)
             color = colors.get(m.status, colors["UNKNOWN"])
-            match = bool(self._highlight) and (
-                self._highlight in (m.placement.designator or "").upper()
-                or self._highlight in (m.key or "").upper()
+            match = bool(highlight) and (
+                highlight in (pl.designator or "").upper()
+                or highlight in (m.key or "").upper()
             )
-            if self._highlight and not match:
+            if highlight and not match:
                 color = QColor(color)
                 color.setAlpha(45)
             painter.setBrush(color)
             painter.setPen(
                 QPen(QColor("#FFFFFF") if match else QColor(0, 0, 0, 60), 2 if match else 0.6)
             )
-            if m.placement.layer is Layer.TOP:
+            if pl.layer is Layer.TOP:
                 painter.drawEllipse(sp, radius, radius)
             else:
                 painter.drawRect(QRectF(sp.x() - radius, sp.y() - radius, radius * 2, radius * 2))
@@ -283,7 +303,7 @@ class BoardCanvas(QWidget):
                 painter.drawText(
                     QRectF(sp.x() + radius + 2, sp.y() - 8, 90, 16),
                     Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-                    m.placement.designator or "",
+                    pl.designator or "",
                 )
 
         painter.setPen(QColor(p["muted"]))

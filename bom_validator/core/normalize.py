@@ -56,12 +56,35 @@ def fold_letters(text: str) -> str:
     return text
 
 
+_NULLISH = {"nan", "none", "nat", "<na>"}
+_SIMPLE_RE = re.compile(r"^[!-~]+(?: [!-~]+)*$")  # printable ASCII, single spaces
+
+
 def clean(value: object) -> str:
-    """Light cleaning suitable for *display*: keeps case and inner spaces."""
+    """Light cleaning suitable for *display*: keeps case and inner spaces.
+
+    A fast path short-circuits the common case (plain ASCII, already tidy),
+    which is the majority of cells in a real workbook and avoids four full
+    string rewrites per cell.
+    """
     if value is None:
         return ""
-    text = str(value)
-    if text.strip().lower() in {"nan", "none", "nat", "<na>"}:
+    if type(value) is str:
+        text = value
+    elif isinstance(value, bool):
+        text = str(value)
+    elif isinstance(value, int):
+        return str(value)
+    else:
+        text = str(value)
+
+    if not text:
+        return ""
+    if _SIMPLE_RE.match(text):
+        # already normalised: no unicode forms, no padding, no double spaces
+        return "" if text.lower() in _NULLISH else text
+
+    if text.strip().lower() in _NULLISH:
         return ""
     text = unicodedata.normalize("NFKC", text)
     text = strip_zero_width(text)
@@ -138,15 +161,8 @@ def to_float(value: object, default: float | None = None) -> float | None:
         return float(m.group()) if m else default
 
 
-def expand_designators(raw: object) -> tuple[str, ...]:
-    """Split a designator cell into individual references.
-
-    Understands comma/semicolon/newline separated lists and ranges such as
-    ``C1-C5`` or ``R10~R14`` which are expanded to the full sequence.
-    """
-    text = clean(raw)
-    if not text:
-        return ()
+@lru_cache(maxsize=50_000)
+def _expand_designators_text(text: str) -> tuple[str, ...]:
     out: list[str] = []
     seen: set[str] = set()
     tokens: list[str] = []
@@ -177,6 +193,18 @@ def expand_designators(raw: object) -> tuple[str, ...]:
     return tuple(out)
 
 
+def expand_designators(raw: object) -> tuple[str, ...]:
+    """Split a designator cell into individual references.
+
+    Understands comma/semicolon/newline separated lists and ranges such as
+    ``C1-C5`` or ``R10~R14`` which are expanded to the full sequence.
+    """
+    text = clean(raw)
+    if not text:
+        return ()
+    return _expand_designators_text(text)
+
+
 def designator_sort_key(designator: str) -> tuple[str, int, str]:
     """Natural sort: C2 before C10."""
     m = _DESIGNATOR_PART_RE.match(designator.strip())
@@ -185,17 +213,87 @@ def designator_sort_key(designator: str) -> tuple[str, int, str]:
     return (designator.upper(), 0, designator)
 
 
-def similarity(a: str, b: str) -> float:
-    """Cheap token-aware similarity in [0, 1] (no external deps)."""
+_TOKEN_SPLIT_RE = re.compile(r"[\s,]+")
+
+
+@lru_cache(maxsize=200_000)
+def _similarity_cached(a: str, b: str) -> float:
     from difflib import SequenceMatcher
 
-    if not a or not b:
-        return 0.0
-    if a == b:
-        return 1.0
+    # keep difflib's default heuristics so scores match previous releases
     base = SequenceMatcher(None, a, b).ratio()
-    ta, tb = set(re.split(r"[\s,]+", a)), set(re.split(r"[\s,]+", b))
+    ta, tb = set(_TOKEN_SPLIT_RE.split(a)), set(_TOKEN_SPLIT_RE.split(b))
     if ta and tb:
         jac = len(ta & tb) / len(ta | tb)
         return max(base, (base + jac) / 2)
     return base
+
+
+def similarity(a: str, b: str) -> float:
+    """Cheap token-aware similarity in [0, 1] (no external deps).
+
+    Memoised, so the repeated comparisons performed while fuzzy-matching a
+    BOM against thousands of placements are served from cache.
+    """
+    if not a or not b:
+        return 0.0
+    if a == b:
+        return 1.0
+    # NB: SequenceMatcher is not symmetric, so the argument order is part of
+    # the cache key — swapping it would change historical scores.
+    return _similarity_cached(a, b)
+
+
+def similarity_at_least(a: str, b: str, threshold: float) -> float:
+    """``similarity(a, b)`` but returns 0.0 as soon as the pair cannot reach
+    ``threshold``.
+
+    ``real_quick_ratio``/``quick_ratio`` are upper bounds on the raw ratio and
+    cost O(n) instead of O(n·m). Because the token blend can lift the raw
+    ratio to at most ``(ratio + 1) / 2``, a pair whose upper bound is below
+    ``2 * threshold - 1`` can never qualify and is discarded without running
+    the expensive matcher. The score of every pair that *does* qualify is
+    exactly what :func:`similarity` returns.
+    """
+    if not a or not b:
+        return 0.0
+    if a == b:
+        return 1.0
+    from difflib import SequenceMatcher
+
+    # small epsilon so a pair sitting exactly on the bound is never dropped
+    need = 2.0 * threshold - 1.0 - 1e-9
+    if need > 0.0:
+        probe = SequenceMatcher(None, a, b)
+        if probe.real_quick_ratio() < need or probe.quick_ratio() < need:
+            return 0.0
+    return _similarity_cached(a, b)
+
+
+def clear_caches() -> None:
+    """Reset the memoisation tables (used by tests and long-running GUIs)."""
+    canonical.cache_clear()
+    header_key.cache_clear()
+    _similarity_cached.cache_clear()
+    _expand_designators_text.cache_clear()
+
+
+def cache_info() -> dict[str, tuple[int, int, int]]:
+    """Hits/misses/size per cache — handy for profiling a slow workbook."""
+    return {
+        "canonical": (
+            canonical.cache_info().hits,
+            canonical.cache_info().misses,
+            canonical.cache_info().currsize,
+        ),
+        "header_key": (
+            header_key.cache_info().hits,
+            header_key.cache_info().misses,
+            header_key.cache_info().currsize,
+        ),
+        "similarity": (
+            _similarity_cached.cache_info().hits,
+            _similarity_cached.cache_info().misses,
+            _similarity_cached.cache_info().currsize,
+        ),
+    }

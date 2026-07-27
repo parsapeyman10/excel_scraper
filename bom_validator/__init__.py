@@ -2,6 +2,7 @@
 
 from .config import AppSettings, ValidationProfile
 from .core.engine import BomValidationEngine, validate_file
+from .io_excel.reader import clear_caches
 from .models import (
     BomLine,
     Issue,
@@ -33,4 +34,5 @@ __all__ = [
     "ValidationSummary",
     "BomValidationEngine",
     "validate_file",
+    "clear_caches",
 ]

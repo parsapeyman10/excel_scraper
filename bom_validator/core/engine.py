@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 from collections import defaultdict
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from ..config import ValidationProfile
@@ -35,10 +37,15 @@ class ValidationCancelled(RuntimeError):
 
 
 class BomValidationEngine:
-    """Stateless-ish orchestrator; one instance per run is cheapest."""
+    """Stateless-ish orchestrator; one instance per run is cheapest.
+
+    ``run()`` keeps the placements of the last run on :attr:`last_placements`
+    so callers such as the GUI board map never have to re-parse the workbook.
+    """
 
     def __init__(self, profile: ValidationProfile | None = None):
         self.profile = profile or ValidationProfile()
+        self.last_placements: list[Placement] = []
 
     # ------------------------------------------------------------------
     def run(
@@ -99,15 +106,8 @@ class BomValidationEngine:
 
         # -- placement sheets ------------------------------------------
         tick(40, 100, "reading placement sheets")
-        placements: list[Placement] = []
-        for name in buckets["top"]:
-            placements += rd.extract_placements(
-                loader.sheets[name], Layer.TOP, self.profile
-            )
-        for name in buckets["bot"]:
-            placements += rd.extract_placements(
-                loader.sheets[name], Layer.BOT, self.profile
-            )
+        placements = self._read_placements(loader, buckets)
+        self.last_placements = placements
         if not placements:
             report.global_issues.append(
                 Issue(
@@ -127,6 +127,7 @@ class BomValidationEngine:
         tick(80, 100, "applying rules")
         self.apply_rules(report, ctx)
 
+        report.metadata["placements_read"] = len(placements)
         report.recompute_summary()
         report.duration_ms = (time.perf_counter() - started) * 1000
         tick(100, 100, "done")
@@ -137,6 +138,36 @@ class BomValidationEngine:
             report.duration_ms,
         )
         return report
+
+    # ------------------------------------------------------------------
+    def _read_placements(
+        self, loader: rd.WorkbookLoader, buckets: dict[str, list[str]]
+    ) -> list[Placement]:
+        """Parse every placement sheet, in parallel when it pays off."""
+        jobs: list[tuple[str, Layer]] = [(n, Layer.TOP) for n in buckets["top"]]
+        jobs += [(n, Layer.BOT) for n in buckets["bot"]]
+        if not jobs:
+            return []
+
+        def work(job: tuple[str, Layer]) -> list[Placement]:
+            name, layer = job
+            return rd.extract_placements(loader.sheets[name], layer, self.profile)
+
+        if len(jobs) == 1:
+            return work(jobs[0])
+
+        rows = sum(len(loader.sheets[n]) for n, _ in jobs)
+        # Parsing is pure Python, so threads only help when there are spare
+        # cores and enough rows to amortise the hand-off.
+        if rows < 20_000 or (os.cpu_count() or 1) < 4:
+            return [pl for job in jobs for pl in work(job)]
+
+        workers = min(len(jobs), (os.cpu_count() or 2), 8)
+        out: list[Placement] = []
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="place") as ex:
+            for chunk in ex.map(work, jobs):
+                out += chunk
+        return out
 
     # ------------------------------------------------------------------
     def match(
@@ -269,10 +300,15 @@ class BomValidationEngine:
         if not out and p.fuzzy_matching and line.part_name:
             target = key_of(line.part_name)
             best, best_score = None, p.fuzzy_threshold
-            for k, group in by_desc.items():
-                score = nz.similarity(target, k)
-                if score >= best_score:
-                    best, best_score = group, score
+            if target:
+                # similarity_at_least() discards hopeless candidates with an
+                # O(n) upper-bound probe before the O(n·m) matcher runs
+                for k, group in by_desc.items():
+                    score = nz.similarity_at_least(target, k, best_score)
+                    if score >= best_score:
+                        best, best_score = group, score
+                        if score >= 1.0:
+                            break  # perfect hit, nothing can beat it
             if best:
                 out = list(best)
         if not out and line.designators:
