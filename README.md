@@ -3,6 +3,58 @@
 ![python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![license](https://img.shields.io/badge/license-MIT-green)
 
+---
+
+## 🇮🇷 نسخهٔ کلاسیک — راهنمای سریع فارسی
+
+این نسخه مستقیماً از **اولین کد کامیت‌شده (~342 خط)** تکامل یافته است و همان منطق
+استخراج را حفظ می‌کند. فایل‌های مربوطه:
+
+| فایل | نقش |
+|---|---|
+| `excel scraper.py` | برنامهٔ اصلی (رابط گرافیکی PyQt6) |
+| `bom_classic_core.py` | منطق استخراج/تطبیق/ساخت خروجی (قابل تست، بدون Qt) |
+| `license_core.py` | هستهٔ لایسنس تک‌کاربره بر اساس Device ID |
+| `license_generator.py` | ابزار صدور لایسنس — **فقط نزد مالک** |
+| `BOM_TOP_BOT_Component_Deffine.xlsx` | فایل نمونه برای تست |
+
+### اجرا (مشتری)
+```bash
+pip install -r requirements.txt
+python "excel scraper.py"
+```
+در اولین اجرا، پنجرهٔ فعال‌سازی باز می‌شود: **شناسهٔ دستگاه** را کپی کرده و برای
+فروشنده بفرستید؛ کلید لایسنس را وارد کنید تا برنامه باز شود. بدون لایسنس معتبر،
+هیچ بخشی از برنامه کار نمی‌کند.
+
+### دو حالت ورودی
+1. **تک‌فایل** — همان رفتار کد اولیه: یک اکسل شامل شیت «مونتاژ ماشینی» + شیت‌های `top` و `bot`.
+2. **سه‌فایل** — اکسل ۱ = BOM (منبع عنوان و ساختار)، اکسل ۲ = TOP، اکسل ۳ = BOT.
+   دکمهٔ «ساخت اکسل خروجی» فایلی می‌سازد که **۱۰۰٪ مثل BOM** است و فقط شیت‌های
+   `top` و `bot` (همراه مختصات PCB: X / Y / Rotation) از فایل‌های جدید پر شده‌اند،
+   به‌علاوهٔ شیت `Validation Report` با نتیجهٔ PASS/FAIL هر قطعه.
+
+### صدور لایسنس (فقط مالک)
+```bash
+python license_generator.py                          # رابط گرافیکی
+python license_generator.py --device <شناسه> --plan 3   # ۱/۳/۶ ماهه
+python license_generator.py --inspect "BOM2-..."        # بازرسی محتوای کلید
+```
+* لایسنس با HMAC-SHA256 امضا و به شناسهٔ سخت‌افزاری دستگاه بسته می‌شود؛
+  جابه‌جایی بین سیستم‌ها و جعل کلید نامعتبر است.
+* زمان انقضا + کنترل عقب‌برگرداندن ساعت سیستم هم اعمال می‌شود.
+* در ویندوز در رجیستری `HKCU\Software\SPCO\BOMValidator` (و فایل پشتیبان در
+  `%APPDATA%`) ذخیره می‌شود.
+* **حد امنیت:** پایتونِ کدباز را هیچ راهی ۱۰۰٪ غیرقابل‌کرک نیست؛ برای تحویل نهایی
+  با PyInstaller/Nuitka خروجی باینری بگیرید و `license_generator.py` + `license_core.py`
+  را **هرگز** به مشتری ندهید.
+
+---
+
+## Platform edition (English docs below)
+
+
+
 Reconciles an electronic **Bill of Material** against the **SMT pick-and-place**
 files for both board layers — line by line, designator by designator — and tells
 you exactly which components will stop the line before the line stops.
