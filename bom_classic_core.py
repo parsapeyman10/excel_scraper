@@ -19,6 +19,7 @@ import collections
 import contextlib
 import datetime
 import os
+from copy import copy
 
 import openpyxl
 import pandas as pd
@@ -400,87 +401,239 @@ def apply_g4_lock(wb, bom_sheet_name: str | None = None,
 # ---------------------------------------------------------------------------
 # خروجی‌های لایه‌ای: دو اکسل با فرمت BOM که فقط قطعات یک لایه + pcb را دارند
 # ---------------------------------------------------------------------------
-def _layer_allowed_keys(results: list[dict], layer: str) -> set[str]:
-    """کلید قطعاتی که دست‌کم یک نقشه در این لایه دارند."""
-    field = 'Top' if layer == "top" else 'Bot'
-    return {
-        _count_key(r['Stock'] if r['Stock'] else r['Part Name'])
-        for r in results if r[field] > 0
-    }
+def parse_placement_records(path: str, preferred: str) -> tuple[list[dict], str, bool]:
+    """
+    خواندن ساخت‌یافتهٔ فایل TOP/BOT: برای هر سطر
+    {designator, stock, description} + نام شیت.
+
+    اگر سربرگِ قابل تشخیص (ستون Designator) پیدا نشود، ok=False برمی‌گردد و
+    «بازسازی BOM لایه» انجام نمی‌شود (فقط فیلتر می‌شود).
+    """
+    xls = pd.ExcelFile(path, engine="openpyxl")
+    sheet = _pick_sheet_name(list(xls.sheet_names), preferred) or xls.sheet_names[0]
+    df = pd.read_excel(xls, sheet_name=sheet, header=None)
+
+    header_row = -1
+    col_des = col_stock = col_desc = -1
+    for r_idx in range(min(15, len(df))):
+        des_here = -1
+        st_here = -1
+        dc_here = -1
+        for c_idx, val in df.iloc[r_idx].items():
+            if pd.isna(val):
+                continue
+            val_str = str(val).strip().lower().replace(" ", "").replace("_", "")
+            if des_here == -1 and 'designator' in val_str:
+                des_here = c_idx
+            elif st_here == -1 and 'stock' in val_str:
+                st_here = c_idx
+            elif dc_here == -1 and ('description' in val_str or 'comment' in val_str):
+                dc_here = c_idx
+        if des_here != -1:
+            header_row, col_des, col_stock, col_desc = r_idx, des_here, st_here, dc_here
+            break
+
+    if header_row == -1:
+        return [], str(sheet), False
+
+    records: list[dict] = []
+    for r_idx in range(header_row + 1, len(df)):
+        des = _cell_to_str(df.iat[r_idx, col_des])
+        stock = _cell_to_str(df.iat[r_idx, col_stock]) if col_stock != -1 else ""
+        desc = _cell_to_str(df.iat[r_idx, col_desc]) if col_desc != -1 else ""
+        if not des and not stock:
+            continue
+        if 'designator' in des.lower():
+            continue  # سربرگ تکراری
+        records.append({
+            'designator': des,
+            'stock': stock,
+            'description': desc,
+        })
+    return records, str(sheet), True
 
 
-def _filter_bom_rows_for_layer(ws, df: pd.DataFrame,
-                               allowed_keys: set[str]) -> int:
+def aggregate_layer(records: list[dict]) -> list[dict]:
     """
-    حذف سطرهای قطعاتی از شیت BOM که در این لایه نیستند.
-    سربرگ/عنوان‌ها و سطرهای غیرداده دست‌نخورده می‌مانند. خروجی: تعداد حذف‌شده.
+    گروه‌بندی رکوردهای نقشه بر اساس «کد انبار یکسان»:
+    خروجی (به ترتیب اولین مشاهده): {key, stock, description, designators[]}
     """
+    groups: dict[str, dict] = {}
+    for rec in records:
+        key = _count_key(rec['stock'] if rec['stock'] else rec['description'])
+        if not key:
+            continue
+        g = groups.setdefault(key, {
+            'key': key,
+            'stock': rec['stock'],
+            'description': rec['description'],
+            'designators': [],
+        })
+        if rec['designator']:
+            g['designators'].append(rec['designator'])
+    return list(groups.values())
+
+
+def _find_bom_columns(df: pd.DataFrame):
+    """ستون‌های BOM شامل Designator و Item — مکمل find_first_matching_headers."""
     header_row, col_part, col_qty, col_stock = find_first_matching_headers(df)
-    if header_row == -1 or col_part == -1 or col_qty == -1 or col_stock == -1:
-        return 0
+    col_des = -1
+    col_item = -1
+    if header_row != -1:
+        for c_idx, val in df.iloc[header_row].items():
+            if pd.isna(val):
+                continue
+            val_str = str(val).strip().lower().replace(" ", "").replace("_", "")
+            if col_des == -1 and 'designator' in val_str:
+                col_des = c_idx
+            elif col_item == -1 and val_str == 'item':
+                col_item = c_idx
+    if col_item == -1:
+        col_item = 0
+    return header_row, col_part, col_qty, col_stock, col_des, col_item
+
+
+def _rebuild_bom_sheet_for_layer(ws, df: pd.DataFrame, groups: list[dict]) -> dict:
+    """
+    بازسازی شیت BOM مخصوص یک لایه:
+
+    * هر کد انبار فقط یک سطر: Designator = همهٔ دیزاینیتورهای همان لایه (با‌هم‌پیوند)
+      و QTY = تعداد واقعی آن‌ها در این لایه
+    * سطرهای تکراریِ یک کد انبار (در BOM اصلی) ادغام می‌شوند
+    * کدهایی که در BOM اصلی نیستند اما در لایه هستند، به انتهای جدول اضافه می‌شوند
+    * سربرگ/عنوان‌ها و سطرهای غیرداده دست‌نخورده می‌مانند
+    """
+    header_row, col_part, col_qty, col_stock, col_des, col_item = _find_bom_columns(df)
+    stats = {"rewritten": 0, "deleted": 0, "appended": 0}
+    if header_row == -1 or col_stock == -1 or col_qty == -1:
+        return stats
+
+    by_key = {g['key']: g for g in groups}
     scans = _scan_bom_rows(df, header_row, col_part, col_qty, col_stock)
-    to_delete = [r['idx'] + 1 for r in scans if r['is_data'] and r['key'] not in allowed_keys]
-    removed = 0
-    for ws_row in sorted(to_delete, reverse=True):  # از پایین به بالا تا جابه‌جایی نشود
-        ws.delete_rows(ws_row, 1)
-        removed += 1
-    return removed
+
+    seen: set[str] = set()
+    delete_ws_rows: list[int] = []
+    data_rows = [s for s in scans if s['is_data']]
+    for s in data_rows:
+        ws_r = s['idx'] + 1
+        if s['key'] not in by_key or s['key'] in seen:
+            delete_ws_rows.append(ws_r)
+            continue
+        seen.add(s['key'])
+        g = by_key[s['key']]
+        ws.cell(row=ws_r, column=col_qty + 1).value = len(g['designators'])
+        if col_des != -1:
+            ws.cell(row=ws_r, column=col_des + 1).value = ", ".join(g['designators'])
+        stats["rewritten"] += 1
+
+    # افزودن کدهای انبارِ موجود در لایه ولی غایب از BOM اصلی
+    new_groups = [g for g in groups if g['key'] not in seen]
+    if new_groups and data_rows:
+        ref_row = data_rows[-1]['idx'] + 1          # آخرین سطر دادهٔ اصلی (قبل از حذف‌ها)
+        ws.insert_rows(ref_row + 1, amount=len(new_groups))
+        style_cols = {col_item, col_des, col_part, col_qty, col_stock}
+        for offset, g in enumerate(new_groups):
+            row = ref_row + 1 + offset
+            for c in style_cols:
+                if c == -1:
+                    continue
+                try:
+                    ws.cell(row=row, column=c + 1)._style = copy(ws.cell(row=ref_row, column=c + 1)._style)
+                except Exception:
+                    pass
+            if col_des != -1:
+                ws.cell(row=row, column=col_des + 1).value = ", ".join(g['designators'])
+            if col_part != -1:
+                ws.cell(row=row, column=col_part + 1).value = g['description']
+            ws.cell(row=row, column=col_qty + 1).value = len(g['designators'])
+            stock_val = g['stock']
+            if isinstance(stock_val, str) and stock_val.isdigit():
+                stock_val = int(stock_val)   # هم‌نوع با سلول‌های کد انبار در BOM
+            ws.cell(row=row, column=col_stock + 1).value = stock_val
+            stats["appended"] += 1
+
+    # حذف سطرها از پایین به بالا (شماره‌ها مبتنی بر ساختار اصلی، زیر نقطهٔ درج)
+    for ws_r in sorted(set(delete_ws_rows), reverse=True):
+        ws.delete_rows(ws_r, 1)
+        stats["deleted"] += 1
+
+    # شماره‌گذاری مجددِ پشت‌سرِ ستون Item (بدون شکافِ ناشی از حذف/درج)
+    _renumber_items(ws, header_row, col_item, col_stock, col_qty)
+    return stats
 
 
-def _add_layer_report_sheet(wb, layer: str, results: list[dict],
-                            bom_path: str, placement_path: str) -> None:
+def _renumber_items(ws, header_row0: int, col_item0: int,
+                    col_stock0: int, col_qty0: int) -> None:
+    """شماره‌گذاری متوالی ستون Item فقط برای سطرهای داده (سربرگ/فوتر/خالی رد می‌شوند)."""
+    if header_row0 < 0 or col_item0 < 0:
+        return
+    n = 0
+    start_row = header_row0 + 2  # ws: header_row0+1 است خود سربرگ؛ از زیر آن اسکن کن
+    for r in range(start_row, ws.max_row + 1):
+        stock = ws.cell(row=r, column=col_stock0 + 1).value
+        qty = ws.cell(row=r, column=col_qty0 + 1).value
+        if stock in (None, "") or not isinstance(qty, (int, float)):
+            continue
+        if any(kw in str(stock).strip().lower() for kw in HEADER_KEYWORDS):
+            continue  # زیرسربرگ «Stock No.»
+        n += 1
+        ws.cell(row=r, column=col_item0 + 1).value = n
+
+
+def _add_layer_report_sheet(wb, layer: str, groups: list[dict],
+                            bom_keys: set[str], placement_path: str) -> None:
+    """گزارش لایه: کد انبار، نام قطعه، تعداد دیزاینیتور و وضعیت حضور در BOM اصلی."""
     title = "Layer Report"
     if title in wb.sheetnames:
         del wb[title]
     ws = wb.create_sheet(title)
     ws.sheet_view.rightToLeft = True
 
-    field = 'Top' if layer == "top" else 'Bot'
-    layer_rows = [r for r in results if r[field] > 0]
     now_txt = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+    in_bom = sum(1 for g in groups if g['key'] in bom_keys)
 
-    ws.append([f"گزارش لایهٔ {layer.upper()} — قطعات این لایه + مختصات PCB"])
+    ws.append([f"گزارش لایهٔ {layer.upper()} — کدهای انبار + تمام Designatorهای لایه"])
     ws.cell(row=1, column=1).font = _TITLE_FONT
     ws.append([f"تاریخ تولید: {now_txt}",
-               f"BOM: {os.path.basename(bom_path)}",
                f"{layer.upper()}: {os.path.basename(placement_path)}"])
-    ws.append([f"قطعات این لایه: {len(layer_rows)}",
-               f"مجموع نقشه‌ها: {sum(r[field] for r in layer_rows)}"])
+    ws.append([f"کدهای انبار لایه: {len(groups)}",
+               f"موجود در BOM اصلی: {in_bom}",
+               f"جدید (فقط در فایل لایه): {len(groups) - in_bom}"])
     ws.append([])
 
-    header = ["Stock ID", "Part Name", "Total Required",
-              f"{layer.upper()} Placements", "Verification Status"]
+    header = ["Stock ID", "Part Name", "Designator Count", "Designators", "In Original BOM"]
     ws.append(header)
     head_row = ws.max_row
     for cell in ws[head_row]:
         cell.font = _HEAD_FONT
         cell.fill = _DARK_FILL
         cell.alignment = Alignment(horizontal="center")
-    for r in layer_rows:
-        ok = r['Valid']
-        ws.append([r['Stock'], r['Part Name'], r['Qty'], r[field], r['Status']])
+    for g in groups:
+        present = g['key'] in bom_keys
+        ws.append([g['stock'], g['description'], len(g['designators']),
+                   ", ".join(g['designators']), "بله" if present else "خیر"])
         row_idx = ws.max_row
-        fill = _PASS_FILL if ok else _FAIL_FILL
+        fill = _PASS_FILL if present else _FAIL_FILL
         for col in range(1, 6):
             ws.cell(row=row_idx, column=col).fill = fill
             ws.cell(row=row_idx, column=col).alignment = Alignment(horizontal="center")
-        ws.cell(row=row_idx, column=2).alignment = Alignment(horizontal="right")
-    widths = [16, 46, 14, 16, 18]
+        ws.cell(row=row_idx, column=4).alignment = Alignment(horizontal="left")
+    widths = [16, 40, 16, 60, 16]
     for i, w in enumerate(widths, start=1):
         ws.column_dimensions[ws.cell(row=head_row, column=i).column_letter].width = w
     ws.freeze_panes = f"A{head_row + 1}"
 
 
 def build_layer_workbook(bom_path: str, placement_path: str, layer: str,
-                         results: list[dict], out_path: str) -> str:
+                         out_path: str) -> str:
     """
-    ساخت اکسلِ یک لایه با فرمت کامل BOM:
+    ساخت اکسلِ یک لایه با فرمت کامل BOM — «BOM مختص آن لایه»:
 
-    * همهٔ ساختار/عنوان فایل BOM دقیقاً حفظ می‌شود
-    * شیت BOM فقط سطرهای قطعاتِ این لایه را نگه می‌دارد (سایر سطرها حذف می‌شوند)
-    * شیت لایهٔ مقابل (در صورت وجود در BOM) حذف می‌شود
-    * شیت این لایه با مقادیر فایل ورودی (Designator + مختصات PCB + Stock) پر می‌شود
-    * شیت «Layer Report» اضافه می‌شود و سلول G4 قفل می‌گردد
+    * همهٔ ساختار/عنوان فایل BOM حفظ می‌شود
+    * شیت BOM بر اساس «کد انبار یکسان» بازسازی می‌شود: برای هر کد، همهٔ
+      Designatorهای واقعی آن لایه + تعدادشان (از داخل فایل TOP/BOT)
+    * شیت لایهٔ مقابل حذف و شیت همین لایه با مقادیر فایل (Designator + مختصات PCB) پر می‌شود
+    * شیت «Layer Report» اضافه و سلول G4 قفل می‌گردد
     """
     if layer not in ("top", "bot"):
         raise ValueError("layer باید 'top' یا 'bot' باشد")
@@ -503,15 +656,25 @@ def build_layer_workbook(bom_path: str, placement_path: str, layer: str,
     dst_ws = wb.create_sheet(layer, min(1, len(wb.sheetnames)))
     _copy_sheet_values(src_ws, dst_ws)
 
-    # ۳) فیلتر سطرهای BOM بر اساس قطعات این لایه
+    # ۳) بازسازی شیت BOM بر اساس کدهای انبار این لایه
     bom_sheet = find_bom_sheet_name(wb.sheetnames)
+    records, _, records_ok = parse_placement_records(placement_path, layer)
+    groups = aggregate_layer(records) if records_ok else []
+    bom_keys: set[str] = set()
     if bom_sheet:
         df = pd.read_excel(bom_path, sheet_name=bom_sheet, header=None, engine="openpyxl")
-        allowed = _layer_allowed_keys(results, layer)
-        _filter_bom_rows_for_layer(wb[bom_sheet], df, allowed)
+        header_row, col_part, col_qty, col_stock = find_first_matching_headers(df)
+        if header_row != -1:
+            bom_keys = {
+                s['key'] for s in _scan_bom_rows(df, header_row, col_part, col_qty, col_stock)
+                if s['is_data']
+            }
+        if records_ok:
+            _rebuild_bom_sheet_for_layer(wb[bom_sheet], df, groups)
 
     # ۴) گزارش لایه و قفل G4
-    _add_layer_report_sheet(wb, layer, results, bom_path, placement_path)
+    if records_ok:
+        _add_layer_report_sheet(wb, layer, groups, bom_keys, placement_path)
     apply_g4_lock(wb, bom_sheet)
 
     wb.save(out_path)
@@ -535,15 +698,16 @@ def build_all_outputs(bom_path: str, top_path: str, bot_path: str,
     """
     ساخت هر سه خروجی:
 
-    * <name>_TOP_v1.xlsx  — فرمت BOM ولی فقط قطعات لایهٔ TOP + مختصات PCB
-    * <name>_BOT_v1.xlsx  — فرمت BOM ولی فقط قطعات لایهٔ BOT + مختصات PCB
+    * <name>_TOP_v1.xlsx  — «BOM مختص لایهٔ TOP»: بر اساس کد انبار یکسان + تمام
+      Designatorهای فایل TOP + تعداد واقعی آن‌ها (+ شیت top با مختصات PCB)
+    * <name>_BOT_v1.xlsx  — همان برای لایهٔ BOT
     * <name>_v1.xlsx      — BOM بازتولیدشدهٔ کامل (دو لایه + گزارش اعتبارسنجی)
 
     در هر سه فایل، سلول G4 = «P.Parsa» و با رمز قفل است.
     """
     paths = make_output_paths(bom_path, out_dir)
-    build_layer_workbook(bom_path, top_path, "top", results, paths["top"])
-    build_layer_workbook(bom_path, bot_path, "bot", results, paths["bot"])
+    build_layer_workbook(bom_path, top_path, "top", paths["top"])
+    build_layer_workbook(bom_path, bot_path, "bot", paths["bot"])
     build_combined_workbook(bom_path, top_path, bot_path, results, paths["bom"],
                             top_sheet_name=top_sheet_name,
                             bot_sheet_name=bot_sheet_name)

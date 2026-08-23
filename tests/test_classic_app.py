@@ -264,6 +264,12 @@ class TestTripleFileMode:
         bom = self._write_xlsx(tmp_path / "bom.xlsx", {
             "مونتاژ ماشینی": [
                 ["Date:", "04/12/12", None, None, None, None, None, None],
+                [None, None, None, None, None, None, None, None],
+                [None, None, None, None, None, None, None, None],
+                [None, None, None, None, None, None, None, None],
+                [None, None, None, None, None, None, None, None],
+                [None, None, None, None, None, None, None, None],
+                [None, None, None, None, None, None, None, None],
                 ["Item", "Designator", "Part Name", "Part No.", "Type", "Size", "QTY", "Brand"],
                 [None, None, None, None, None, None, None, "Stock No."],
                 [1, "C1-C2", "Cap 47N", "PN1", "X7R", "0603", 2, 1110101],
@@ -364,7 +370,7 @@ class TestTripleFileMode:
 
 
 class TestThreeOutputs:
-    """سه خروجی: TOP فقط لایهٔ top، BOT فقط لایهٔ bot و BOM بازتولیدشده."""
+    """سه خروجی: BOM مختص هر لایه (کد انبار یکسان + تمام Designatorها) + BOM بازتولیدشده."""
 
     def _write_xlsx(self, path: Path, sheets: dict[str, list[list]]) -> Path:
         wb = openpyxl.Workbook()
@@ -383,10 +389,17 @@ class TestThreeOutputs:
         bom = self._write_xlsx(tmp_path / "main BOM.xlsx", {
             "مونتاژ ماشینی": [
                 ["F1 Co", None, None, None, None, "  Provided  by :", "Someone", None],
+                [None, None, None, None, None, None, None, None],
+                [None, None, None, None, None, None, None, None],
+                [None, None, None, None, None, None, None, None],
+                [None, None, None, None, None, None, None, None],
+                [None, None, None, None, None, None, None, None],
+                [None, None, None, None, None, None, None, None],
                 ["Item", "Designator", "Part Name", "Part No.", "Type", "Size", "QTY", "Brand"],
                 [None, None, None, None, None, None, None, "Stock No."],
-                [1, "C1-C2", "Cap 47N", "PN1", "X7R", "0603", 2, 1110101],
-                [2, "R1", "Res 10K", "PN2", "R", "0603", 1, 1110202],
+                [1, "C1-C2", "Cap 47N", "PN1", "X7R", "0603", 3, 1110101],
+                [2, "D5", "Cap 47N", "PN1", "X7R", "0603", 1, 1110101],   # کد انبار تکراری → ادغام
+                [3, "R1", "Res 10K", "PN2", "R", "0603", 2, 1110202],
                 ["یادداشت پایانی", None, None, None, None, None, None, None],
             ],
             "top": [["old", "top"]],
@@ -397,12 +410,14 @@ class TestThreeOutputs:
                 ["Designator", "Center-X(mm)", "Center-Y(mm)", "Rotation", "SPCO Stock Number", "Description"],
                 ["C1", 10.5, 20.5, 90, 1110101, "Cap 47N"],
                 ["C2", 11.5, 21.5, 270, 1110101, "Cap 47N"],
+                ["C7", 15.0, 25.0, 0, 1110999, "LED RED"],   # کد انبار جدید (در BOM نیست)
             ]
         })
         bot = self._write_xlsx(tmp_path / "bot.xlsx", {
             "bot": [
                 ["Designator", "Center-X(mm)", "Center-Y(mm)", "Rotation", "SPCO Stock Number", "Description"],
                 ["R1", 30.0, 40.0, 180, 1110202, "Res 10K"],
+                ["R3", 31.0, 41.0, 90, 1110202, "Res 10K"],
             ]
         })
         results = classic.evaluate_rows(
@@ -411,6 +426,18 @@ class TestThreeOutputs:
             classic.load_placement_values(str(bot), "bot")[0],
         )
         return bom, top, bot, results
+
+    def _data_rows(self, ws):
+        """(stock, qty, designator, part, item) برای سطرهایی که ستون ۸ عدد دارند."""
+        out = []
+        for r in range(1, ws.max_row + 1):
+            stock = ws.cell(row=r, column=8).value
+            if isinstance(stock, (int, float)):
+                out.append((int(stock), ws.cell(row=r, column=7).value,
+                            ws.cell(row=r, column=2).value,
+                            ws.cell(row=r, column=3).value,
+                            ws.cell(row=r, column=1).value))
+        return out
 
     def test_names_are_base_plus_v1(self, files, tmp_path):
         bom, top, bot, results = files
@@ -423,28 +450,42 @@ class TestThreeOutputs:
         for p in paths.values():
             assert os.path.exists(p)
 
-    def test_top_output_has_only_top_parts(self, files):
+    def test_top_output_is_layer_bom(self, files):
         bom, top, bot, results = files
         paths = classic.build_all_outputs(
             str(bom), str(top), str(bot), results, os.path.dirname(str(bom)))
         wb = openpyxl.load_workbook(paths["top"])
-        # شیت bot حذف، شیت top از فایل جدید
         assert "bot" not in wb.sheetnames
         assert "top" in wb.sheetnames
         assert wb["top"]["A2"].value == "C1"
         assert wb["top"]["E2"].value == 1110101
-        # شیت BOM فقط سطر قطعات لایهٔ top (قطعهٔ bot-only حذف شده)
+
         ws = wb["مونتاژ ماشینی"]
-        stocks = [ws.cell(row=r, column=8).value for r in range(1, ws.max_row + 1)]
-        assert 1110101 in stocks and 1110202 not in stocks
-        # یادداشت پایانی (غیرداده) و سربرگ‌ها حفظ شده‌اند
+        rows = self._data_rows(ws)
+        by_stock = {r[0]: r for r in rows}
+
+        # ۱) هر کد انبار دقیقاً یک سطر (کد تکراری ادغام شده)
+        assert [r[0] for r in rows].count(1110101) == 1
+        # ۲) Designatorهای واقعی لایه + تعداد واقعی لایه (نه تعداد کل BOM)
+        assert by_stock[1110101][1] == 2            # QTY = ۲ نه ۳
+        assert by_stock[1110101][2] == "C1, C2"
+        # ۳) کد انبار جدیدِ موجود فقط در فایل top، سطر تازه می‌گیرد
+        assert 1110999 in by_stock
+        assert by_stock[1110999][1] == 1
+        assert by_stock[1110999][2] == "C7"
+        assert by_stock[1110999][3] == "LED RED"    # Part Name از Description لایه
+        # شماره‌گذاری Item پشت‌سر و بدون شکاف: ۱ (کد ادغام‌شده) و ۲ (سطر تازه)
+        assert by_stock[1110101][4] == 1
+        assert by_stock[1110999][4] == 2
+        # ۴) قطعهٔ bot-only حذف شده
+        assert 1110202 not in by_stock
+        # ۵) سربرگ/عنوان و یادداشت غیرداده حفظ شده
         assert ws["A1"].value == "F1 Co"
         assert any("یادداشت" in str(ws.cell(row=r, column=1).value or "")
                    for r in range(1, ws.max_row + 1))
-        # گزارش لایه وجود دارد
         assert "Layer Report" in wb.sheetnames
 
-    def test_bot_output_has_only_bot_parts(self, files):
+    def test_bot_output_is_layer_bom(self, files):
         bom, top, bot, results = files
         paths = classic.build_all_outputs(
             str(bom), str(top), str(bot), results, os.path.dirname(str(bom)))
@@ -452,9 +493,13 @@ class TestThreeOutputs:
         assert "top" not in wb.sheetnames
         assert "bot" in wb.sheetnames
         assert wb["bot"]["A2"].value == "R1"
+
         ws = wb["مونتاژ ماشینی"]
-        stocks = [ws.cell(row=r, column=8).value for r in range(1, ws.max_row + 1)]
-        assert 1110202 in stocks and 1110101 not in stocks
+        rows = self._data_rows(ws)
+        by_stock = {r[0]: r for r in rows}
+        assert 1110101 not in by_stock
+        assert by_stock[1110202][1] == 2
+        assert by_stock[1110202][2] == "R1, R3"
 
     def test_g4_locked_in_all_outputs(self, files):
         bom, top, bot, results = files
