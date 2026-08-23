@@ -4,6 +4,8 @@
 
 مدل کار (مبتنی بر Device ID):
 
+0. بدون لایسنس، برنامه از اولین اجرا به‌طور خودکار یک‌ماه آزمایشی کار می‌کند؛
+   پس از آن بدون لایسنس معتبر از کار می‌افتد.
 1. مشتری برنامه را اجرا می‌کند؛ برنامه «شناسهٔ دستگاه» را نمایش می‌دهد.
 2. مشتری شناسه را برای صاحبِ نرم‌افزار می‌فرستد.
 3. صاحبِ نرم‌افزار با ابزار ``license_generator.py`` (فقط نزد مالک می‌ماند و
@@ -74,6 +76,9 @@ _STORE_FILE = "license_store.json"
 
 # مقدار تحمل برای نوسان ساعت (۲ ساعت) تا برنامه با اختلاف کوچک ساعت قفل نشود
 _CLOCK_TOLERANCE_SECONDS = 2 * 3600
+
+# دورهٔ آزمایشی خودکار: از اولین اجرا یک‌ماه بدون لایسنس کار می‌کند
+TRIAL_DAYS = 30
 
 
 # ---------------------------------------------------------------------------
@@ -260,6 +265,42 @@ def check_clock(now: int | None = None) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# دورهٔ آزمایشی یک‌ماههٔ خودکار (از اولین اجرا، بدون نیاز به لایسنس)
+# ---------------------------------------------------------------------------
+def _seal_trial_stamp(ts: int) -> str:
+    """مهر آغاز آزمایش — امضاشده و بسته به شناسهٔ دستگاه (قابل کپی به سیستم دیگر نیست)."""
+    msg = f"trial::{get_device_id_raw()}::{ts}"
+    sig = hmac.new(_master_key(), msg.encode(), hashlib.sha256).hexdigest()[:24]
+    return f"{ts}.{sig}"
+
+
+def _unseal_trial_stamp(blob: str) -> int | None:
+    try:
+        ts_txt, sig = blob.split(".", 1)
+        ts = int(ts_txt)
+    except Exception:
+        return None
+    msg = f"trial::{get_device_id_raw()}::{ts}"
+    expect = hmac.new(_master_key(), msg.encode(), hashlib.sha256).hexdigest()[:24]
+    if not hmac.compare_digest(expect, sig):
+        return None
+    return ts
+
+
+def _ensure_trial_stamp(now: int | None = None) -> int | None:
+    """
+    در اولین اجرا مهر آغاز آزمایش را می‌سازد و برمی‌گرداند.
+    اگر مهر موجود اما دست‌کاری‌شده باشد (امضا نامعتبر) None برمی‌گردد ⇒ آزمایش نامعتبر است.
+    """
+    blob = _store_get("trial")
+    if blob:
+        return _unseal_trial_stamp(blob)
+    now_i = int(now if now is not None else time.time())
+    _store_set("trial", _seal_trial_stamp(now_i))
+    return now_i
+
+
+# ---------------------------------------------------------------------------
 # ساخت / اعتبارسنجی کلید لایسنس
 # ---------------------------------------------------------------------------
 def build_license_key(device_id: str, months: int, issued_at: int | None = None) -> str:
@@ -288,7 +329,7 @@ def build_license_key(device_id: str, months: int, issued_at: int | None = None)
 @dataclass
 class LicenseState:
     ok: bool
-    code: str  # ok | missing | malformed | signature | device | expired | clock
+    code: str  # ok | trial | trial_expired | missing | malformed | signature | device | expired | clock
     reason: str
     plan: str = ""
     plan_title: str = ""
@@ -304,6 +345,18 @@ class LicenseState:
         days = f"{self.days_left} روز" if self.days_left is not None else "—"
         exp = self.expires_at.strftime("%Y/%m/%d") if self.expires_at else "—"
         return f"لایسنس {self.plan_title} — تا {exp} ({days} باقی)"
+
+    @property
+    def short_label(self) -> str:
+        """برچسب کوتاه برای رابط کاربری (بدون نمایش روزهای باقی‌مانده)."""
+        labels = {
+            "ok": "لایسنس فعال",
+            "trial": "نسخهٔ آزمایشی",
+            "trial_expired": "پایان دورهٔ آزمایشی",
+            "expired": "لایسنس منقضی‌شده",
+            "missing": "بدون لایسنس",
+        }
+        return labels.get(self.code, "لایسنس نامعتبر")
 
 
 def _fail(code: str, reason: str) -> LicenseState:
@@ -399,11 +452,39 @@ def activate(key: str) -> LicenseState:
 
 
 def current_state(now: int | None = None) -> LicenseState:
-    """وضعیت فعلی لایسنس نصب‌شده روی دستگاه."""
+    """
+    وضعیت فعلی دسترسی برنامه:
+
+    * لایسنس معتبر ثبت‌شده → فعال
+    * بدون لایسنس → دورهٔ آزمایشی خودکار یک‌ماهه از اولین اجرا
+    * پایان آزمایش (یا خرابی هر حافظهٔ امضاشده) → عدم دسترسی تا فعال‌سازی
+    """
     key = _store_get("license")
+    now_i = int(now if now is not None else time.time())
+
     if not key:
-        return _fail("missing", "هیچ لایسنسی روی این دستگاه ثبت نشده است")
-    state = verify_license_key(key, now=now)
+        stamp = _ensure_trial_stamp(now_i)
+        if stamp is None:
+            return _fail("trial_expired",
+                         "اطلاعات دورهٔ آزمایشی معتبر نیست؛ برای فعال‌سازی لایسنس تهیه کنید")
+        expires = stamp + TRIAL_DAYS * 86400
+        days_left = max(0, (expires - now_i) // 86400)
+        if now_i >= expires or not check_clock(now_i):
+            return LicenseState(
+                ok=False, code="trial_expired",
+                reason="دورهٔ یک‌ماههٔ آزمایشی پایان یافته است — برای ادامه لایسنس تهیه کنید",
+                plan_title="آزمایشی", days_left=0,
+                expires_at=datetime.fromtimestamp(expires),
+            )
+        note_successful_run(now_i)
+        return LicenseState(
+            ok=True, code="trial",
+            reason="نسخهٔ آزمایشی فعال است",
+            plan_title="آزمایشی", days_left=days_left,
+            expires_at=datetime.fromtimestamp(expires),
+        )
+
+    state = verify_license_key(key, now=now_i)
     if state.ok:
         note_successful_run()
     elif state.code == "clock":

@@ -55,7 +55,7 @@ from PyQt6.QtWidgets import (
 import license_core
 from bom_classic_core import (
     _pick_sheet_name,
-    build_combined_workbook,
+    build_all_outputs,
     evaluate_rows,
     extract_bom_rows,
     extract_data,
@@ -117,7 +117,7 @@ class ActivationDialog(QDialog):
         title.setStyleSheet("font-size:15px;font-weight:bold;color:#E5E9F0;")
         layout.addWidget(title)
 
-        self.lbl_reason = QLabel(f"وضعیت: {state.reason}")
+        self.lbl_reason = QLabel(state.reason)
         self.lbl_reason.setStyleSheet("color:#F87171;font-weight:bold;")
         self.lbl_reason.setWordWrap(True)
         layout.addWidget(self.lbl_reason)
@@ -164,10 +164,7 @@ class ActivationDialog(QDialog):
             return
         state = license_core.activate(key)
         if state.ok:
-            QMessageBox.information(
-                self, "فعال‌سازی موفق",
-                f"لایسنس با موفقیت فعال شد.\n{state.summary}"
-            )
+            QMessageBox.information(self, "فعال‌سازی موفق", "لایسنس با موفقیت فعال شد.")
             self.accept()
         else:
             self.lbl_reason.setText(f"خطا: {state.reason}")
@@ -198,7 +195,7 @@ class LicenseInfoDialog(QDialog):
 
         if state.ok:
             self.lbl.setStyleSheet("color:#34D399;font-weight:bold;font-size:13px;")
-            self.lbl.setText(f"✅ {state.summary}")
+            self.lbl.setText(f"✅ {state.short_label}")
         else:
             self.lbl.setStyleSheet("color:#F87171;font-weight:bold;font-size:13px;")
             self.lbl.setText(f"⛔ {state.reason}")
@@ -273,10 +270,11 @@ class IndustrialBOMValidator(QMainWindow):
         top_bar.addWidget(lbl_logo)
         main_layout.addLayout(top_bar)
 
-        # سربرگ حالت‌های ورود فایل
+        # سربرگ حالت‌های ورود فایل + تب لایسنس
         self.tabs = QTabWidget()
         self.tabs.addTab(self._build_single_tab(), "📄 حالت تک‌فایل (BOM کامل)")
         self.tabs.addTab(self._build_triple_tab(), "📑 حالت سه‌فایل (BOM + TOP + BOT)")
+        self.tabs.addTab(self._build_license_tab(), "🔐 لایسنس")
         self.tabs.currentChanged.connect(self._on_tab_change)
         main_layout.addWidget(self.tabs)
 
@@ -303,7 +301,7 @@ class IndustrialBOMValidator(QMainWindow):
         self.search_box.textChanged.connect(self._apply_filter)
         self.btn_copy_fails = QPushButton("کپی موارد FAIL")
         self.btn_copy_fails.clicked.connect(self.copy_fail_rows)
-        self.btn_export = QPushButton("💾 ساخت اکسل خروجی (سه‌فایل)")
+        self.btn_export = QPushButton("💾 ساخت ۳ خروجی (TOP / BOT / BOM)")
         self.btn_export.setObjectName("successBtn")
         self.btn_export.setEnabled(False)
         self.btn_export.clicked.connect(self.export_combined_excel)
@@ -378,9 +376,9 @@ class IndustrialBOMValidator(QMainWindow):
         tab = QWidget()
         layout = QVBoxLayout(tab)
         info = QLabel(
-            "در این حالت سه فایل جدا انتخاب می‌شود: اکسل اول = BOM (منبع عنوان و ساختار خروجی)، "
-            "اکسل دوم = نقشهٔ TOP و اکسل سوم = نقشهٔ BOT. خروجی، اکسلی است ۱۰۰٪ مشابه BOM "
-            "که فقط مقادیر top و bot (با مختصات PCB) از فایل‌های جدید در آن قرار می‌گیرد."
+            "اکسل BOM + دو فایل TOP/BOT را انتخاب کنید. سه خروجی ساخته می‌شود: "
+            "نسخهٔ TOP (فقط قطعات لایهٔ top + مختصات PCB)، نسخهٔ BOT و BOM بازتولیدشده — "
+            "هر سه با همان فرمت و نام فایل اصلی + v1 و با G4 قفل‌شده (P.Parsa)."
         )
         info.setStyleSheet("color:#8B93A7;")
         info.setWordWrap(True)
@@ -418,6 +416,93 @@ class IndustrialBOMValidator(QMainWindow):
         layout.addWidget(self.btn_process3)
         layout.addStretch(1)
         return tab
+
+    def _build_license_tab(self) -> QWidget:
+        """تب لایسنس — نمایش وضعیت، شناسهٔ دستگاه و ثبت کلید لایسنس."""
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setSpacing(10)
+
+        self.lbl_license_status = QLabel()
+        self.lbl_license_status.setStyleSheet("font-size:14px;font-weight:bold;")
+        layout.addWidget(self.lbl_license_status)
+
+        info = QLabel("برای فعال‌سازی دائمی، شناسهٔ دستگاه را برای فروشنده بفرستید "
+                      "و کلید لایسنس دریافتی را اینجا ثبت کنید.")
+        info.setStyleSheet("color:#8B93A7;")
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        group = QGroupBox("شناسهٔ دستگاه")
+        g = QHBoxLayout(group)
+        self.ed_device_id = QLineEdit(license_core.get_device_id())
+        self.ed_device_id.setReadOnly(True)
+        self.ed_device_id.setStyleSheet("font-family:Consolas;")
+        btn_copy_dev = QPushButton("کپی شناسه")
+        btn_copy_dev.clicked.connect(self._copy_device_id)
+        g.addWidget(self.ed_device_id, 1)
+        g.addWidget(btn_copy_dev)
+        layout.addWidget(group)
+
+        group2 = QGroupBox("کلید لایسنس")
+        g2 = QVBoxLayout(group2)
+        self.ed_license_key = QPlainTextEdit()
+        self.ed_license_key.setPlaceholderText("BOM2-XXXXX-XXXXX-…")
+        self.ed_license_key.setMaximumHeight(80)
+        self.ed_license_key.setStyleSheet("font-family:Consolas;")
+        g2.addWidget(self.ed_license_key)
+        layout.addWidget(group2)
+
+        btns = QHBoxLayout()
+        self.btn_license_activate = QPushButton("فعال‌سازی لایسنس")
+        self.btn_license_activate.setObjectName("primaryBtn")
+        self.btn_license_activate.setMinimumHeight(34)
+        self.btn_license_activate.clicked.connect(self._activate_from_tab)
+        self.btn_license_remove = QPushButton("حذف لایسنس")
+        self.btn_license_remove.setObjectName("dangerBtn")
+        self.btn_license_remove.clicked.connect(self._deactivate_from_tab)
+        btns.addWidget(self.btn_license_activate)
+        btns.addWidget(self.btn_license_remove)
+        btns.addStretch(1)
+        layout.addLayout(btns)
+
+        self.lbl_license_msg = QLabel("")
+        self.lbl_license_msg.setWordWrap(True)
+        layout.addWidget(self.lbl_license_msg)
+        layout.addStretch(1)
+        return tab
+
+    def _copy_device_id(self) -> None:
+        QGuiApplication.clipboard().setText(self.ed_device_id.text())
+        self.lbl_license_msg.setStyleSheet("color:#34D399;")
+        self.lbl_license_msg.setText("شناسهٔ دستگاه در کلیپ‌بورد کپی شد.")
+
+    def _activate_from_tab(self) -> None:
+        key = self.ed_license_key.toPlainText().strip()
+        if not key:
+            self.lbl_license_msg.setStyleSheet("color:#FBBF24;")
+            self.lbl_license_msg.setText("کلید لایسنس را وارد کنید.")
+            return
+        state = license_core.activate(key)
+        if state.ok:
+            self.lbl_license_msg.setStyleSheet("color:#34D399;")
+            self.lbl_license_msg.setText("لایسنس با موفقیت فعال شد.")
+            self.ed_license_key.clear()
+        else:
+            self.lbl_license_msg.setStyleSheet("color:#F87171;")
+            self.lbl_license_msg.setText(f"خطا: {state.reason}")
+        self.refresh_license_badge()
+
+    def _deactivate_from_tab(self) -> None:
+        ret = QMessageBox.question(
+            self, "حذف لایسنس",
+            "لایسنس از این دستگاه حذف شود؟",
+        )
+        if ret == QMessageBox.StandardButton.Yes:
+            license_core.deactivate()
+            self.lbl_license_msg.setStyleSheet("color:#8B93A7;")
+            self.lbl_license_msg.setText("لایسنس حذف شد.")
+            self.refresh_license_badge()
 
     # -- تم -----------------------------------------------------------
     def apply_industrial_theme(self):
@@ -497,15 +582,18 @@ class IndustrialBOMValidator(QMainWindow):
     # -- لایسنس ------------------------------------------------------
     def refresh_license_badge(self) -> None:
         state = license_core.current_state()
-        if state.ok:
-            self.badge_license.setText(f"🔓 {state.summary}")
-        else:
-            self.badge_license.setText("🔒 بدون لایسنس معتبر")
-        self.setWindowTitle(
-            f"{APP_TITLE} — v{APP_VERSION}"
-            + (f"  |  ⏳ {state.days_left} روز مانده"
-               if state.ok and state.days_left is not None else "")
-        )
+        icons = {"ok": "🔓", "trial": "🧪"}
+        icon = icons.get(state.code, "🔒")
+        self.badge_license.setText(f"{icon} {state.short_label}")
+        self.setWindowTitle(f"{APP_TITLE} — v{APP_VERSION}")
+        # به‌روزرسانی تب لایسنس
+        if hasattr(self, "lbl_license_status"):
+            colors = {"ok": "#34D399", "trial": "#FBBF24"}
+            color = colors.get(state.code, "#F87171")
+            self.lbl_license_status.setStyleSheet(
+                f"font-size:14px;font-weight:bold;color:{color};")
+            self.lbl_license_status.setText(
+                f"{icon} وضعیت: {state.short_label if state.ok else state.reason}")
 
     def _require_license(self) -> bool:
         """هر عملیات حساس از اینجا عبور می‌کند؛ بدون لایسنس معتبر متوقف می‌شود."""
@@ -641,33 +729,32 @@ class IndustrialBOMValidator(QMainWindow):
         if not self.results_cache:
             QMessageBox.information(self, "بدون داده", "ابتدا پردازش سه‌فایل را انجام دهید.")
             return
-        base = os.path.splitext(os.path.basename(self.bom_file))[0]
-        default = os.path.join(
-            os.path.dirname(self.bom_file), f"{base}_BOM_TOP_BOT.xlsx")
-        out_path, _ = QFileDialog.getSaveFileName(
-            self, "ذخیرهٔ اکسل خروجی (کلون BOM + TOP/BOT جدید)",
-            default, "Excel Files (*.xlsx)"
+        out_dir = QFileDialog.getExistingDirectory(
+            self, "پوشهٔ ذخیرهٔ سه خروجی (TOP / BOT / BOM)",
+            os.path.dirname(self.bom_file) or "",
         )
-        if not out_path:
+        if not out_dir:
             return
-        if not out_path.lower().endswith(".xlsx"):
-            out_path += ".xlsx"
-        self._set_busy(True, "در حال ساخت اکسل خروجی…")
+        self._set_busy(True, "در حال ساخت سه اکسل خروجی…")
         QApplication.processEvents()
         try:
-            build_combined_workbook(
+            paths = build_all_outputs(
                 self.bom_file, self.top_file, self.bot_file,
-                self.results_cache, out_path,
+                self.results_cache, out_dir,
                 top_sheet_name=self.top_sheet_used if self.top_sheet_used != "-" else "top",
                 bot_sheet_name=self.bot_sheet_used if self.bot_sheet_used != "-" else "bot",
             )
             license_core.note_successful_run()
-            self.status_bar.showMessage(f"اکسل خروجی ساخته شد: {out_path}")
+            listing = "\n".join(
+                f"• {os.path.basename(p)}" for p in (paths["top"], paths["bot"], paths["bom"])
+            )
+            self.status_bar.showMessage(f"سه خروجی در «{out_dir}» ساخته شد.")
             QMessageBox.information(
                 self, "موفق",
-                "اکسل خروجی ساخته شد — ساختار و عنوان دقیقاً مثل BOM است و\n"
-                "فقط شیت‌های top و bot از فایل‌های جدید پر شده‌اند (+ شیت Validation Report).\n\n"
-                f"{out_path}"
+                "سه فایل خروجی با فرمت و نام فایل اصلی (+ v1) ساخته شد:\n\n"
+                f"{listing}\n\n"
+                "در هر سه فایل سلول G4 = \"P.Parsa\" و قفل است.\n"
+                "نسخهٔ TOP فقط قطعات لایهٔ top + مختصات PCB را دارد و نسخهٔ BOT فقط bot."
             )
         except Exception as e:  # noqa: BLE001
             QMessageBox.critical(self, "خطای نوشتن خروجی", str(e))
@@ -802,14 +889,17 @@ class IndustrialBOMValidator(QMainWindow):
 
 
 # ---------------------------------------------------------------------------
-# نقطهٔ ورود — گیت اجباری لایسنس
+# نقطهٔ ورود — برنامه باز می‌شود؛ دسترسی بر اساس لایسنس/آزمایشی
 # ---------------------------------------------------------------------------
 
 def ensure_license() -> bool:
-    """بدون لایسنس معتبر، پنجرهٔ اصلی اصلاً باز نمی‌شود."""
+    """
+    برنامه همیشه باز می‌شود؛ اما:
+    * با لایسنس معتبر یا در دورهٔ آزمایشی یک‌ماهه → ادامهٔ عادی
+    * پایان آزمایش بدون لایسنس → دیالوگ اجباری فعال‌سازی؛ انصراف = خروج از برنامه
+    """
     state = license_core.current_state()
     if state.ok:
-        license_core.note_successful_run()
         return True
     dlg = ActivationDialog(state)
     return dlg.exec() == QDialog.DialogCode.Accepted
@@ -827,11 +917,13 @@ def main(argv: list[str] | None = None) -> int:
     app.setStyleSheet(
         "QToolTip { background:#1B2432; color:#E5E9F0; border:1px solid #2A3550; }")
 
+    window = IndustrialBOMValidator()
+    window.show()
+
+    # پس از نمایش پنجره: اگر دورهٔ آزمایشی تمام و لایسنسی نیست، فعال‌سازی اجباری است
     if not ensure_license():
         return 0
 
-    window = IndustrialBOMValidator()
-    window.show()
     return app.exec()
 
 

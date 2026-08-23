@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import importlib.util
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -97,16 +98,19 @@ class TestLicenseCore:
                                                device_id=self.DEV).code == "malformed"
 
     def test_activation_cycle(self):
+        # بدون لایسنس، برنامه در دورهٔ آزمایشی کار می‌کند
         state = license_core.current_state()
-        assert not state.ok and state.code == "missing"
+        assert state.ok and state.code == "trial"
         # activate() روی دستگاه جاری عمل می‌کند؛ پس کلید دستگاه جاری می‌سازیم
         real_dev = license_core.get_device_id_raw()
         real_key = license_core.build_license_key(real_dev, months=6)
         ok_state = license_core.activate(real_key)
         assert ok_state.ok
         assert license_core.current_state().ok
+        # حذف لایسنس در دورهٔ آزمایشی → بازگشت به حالت آزمایشی
         license_core.deactivate()
-        assert not license_core.current_state().ok
+        after = license_core.current_state()
+        assert after.ok and after.code == "trial"
 
     def test_clock_tamper_detected(self):
         real_dev = license_core.get_device_id_raw()
@@ -132,6 +136,41 @@ class TestLicenseCore:
         raw = license_core.get_device_id_raw()
         assert raw == dashed.replace("-", "")
         assert len(raw) == 40 and all(c in "0123456789ABCDEF" for c in raw)
+
+
+class TestTrial:
+    """دورهٔ آزمایشی خودکار یک‌ماهه."""
+
+    def test_first_run_starts_trial(self):
+        state = license_core.current_state()
+        assert state.ok and state.code == "trial"
+        assert state.short_label == "نسخهٔ آزمایشی"
+
+    def test_trial_active_for_30_days(self):
+        now = time.time()
+        license_core._store_set("trial", license_core._seal_trial_stamp(int(now - 29 * 86400)))
+        state = license_core.current_state()
+        assert state.ok and state.code == "trial"
+
+    def test_trial_expires_after_30_days(self):
+        license_core._store_set(
+            "trial", license_core._seal_trial_stamp(int(time.time() - 31 * 86400)))
+        state = license_core.current_state()
+        assert not state.ok and state.code == "trial_expired"
+        assert "آزمایشی" in state.reason
+
+    def test_tampered_trial_stamp_blocked(self):
+        license_core._store_set("trial", "1234567890.deadbeef")
+        state = license_core.current_state()
+        assert not state.ok and state.code == "trial_expired"
+
+    def test_license_overrides_expired_trial(self):
+        license_core._store_set(
+            "trial", license_core._seal_trial_stamp(int(time.time() - 40 * 86400)))
+        key = license_core.build_license_key(license_core.get_device_id_raw(), months=1)
+        assert license_core.activate(key).ok
+        state = license_core.current_state()
+        assert state.ok and state.code == "ok"
 
 
 # ---------------------------------------------------------------------------
@@ -305,6 +344,130 @@ class TestTripleFileMode:
         # محتوای قدیمی شیت top در BOM («will be replaced») دیگر وجود ندارد
         flat = [str(v) for row in wb["top"].iter_rows(values_only=True) for v in row]
         assert "will" not in flat
+
+    def test_combined_locks_g4(self, files, tmp_path):
+        bom, top, bot = files
+        results = classic.evaluate_rows(
+            classic.extract_bom_rows(str(bom)),
+            classic.load_placement_values(str(top), "top")[0],
+            classic.load_placement_values(str(bot), "bot")[0],
+        )
+        out = tmp_path / "combined_g4.xlsx"
+        classic.build_combined_workbook(str(bom), str(top), str(bot), results, str(out))
+        wb = openpyxl.load_workbook(out)
+        ws = wb["مونتاژ ماشینی"]
+        assert ws["G4"].value == "P.Parsa"
+        assert ws["G4"].protection.locked is True
+        assert ws["A1"].protection.locked is False
+        assert ws.protection.sheet is True
+        assert ws.protection.password  # هش رمز ذخیره شده است
+
+
+class TestThreeOutputs:
+    """سه خروجی: TOP فقط لایهٔ top، BOT فقط لایهٔ bot و BOM بازتولیدشده."""
+
+    def _write_xlsx(self, path: Path, sheets: dict[str, list[list]]) -> Path:
+        wb = openpyxl.Workbook()
+        first = True
+        for name, rows in sheets.items():
+            ws = wb.active if first else wb.create_sheet(name)
+            ws.title = name
+            first = False
+            for row in rows:
+                ws.append(row)
+        wb.save(path)
+        return path
+
+    @pytest.fixture
+    def files(self, tmp_path):
+        bom = self._write_xlsx(tmp_path / "main BOM.xlsx", {
+            "مونتاژ ماشینی": [
+                ["F1 Co", None, None, None, None, "  Provided  by :", "Someone", None],
+                ["Item", "Designator", "Part Name", "Part No.", "Type", "Size", "QTY", "Brand"],
+                [None, None, None, None, None, None, None, "Stock No."],
+                [1, "C1-C2", "Cap 47N", "PN1", "X7R", "0603", 2, 1110101],
+                [2, "R1", "Res 10K", "PN2", "R", "0603", 1, 1110202],
+                ["یادداشت پایانی", None, None, None, None, None, None, None],
+            ],
+            "top": [["old", "top"]],
+            "bot": [["old", "bot"]],
+        })
+        top = self._write_xlsx(tmp_path / "top.xlsx", {
+            "top": [
+                ["Designator", "Center-X(mm)", "Center-Y(mm)", "Rotation", "SPCO Stock Number", "Description"],
+                ["C1", 10.5, 20.5, 90, 1110101, "Cap 47N"],
+                ["C2", 11.5, 21.5, 270, 1110101, "Cap 47N"],
+            ]
+        })
+        bot = self._write_xlsx(tmp_path / "bot.xlsx", {
+            "bot": [
+                ["Designator", "Center-X(mm)", "Center-Y(mm)", "Rotation", "SPCO Stock Number", "Description"],
+                ["R1", 30.0, 40.0, 180, 1110202, "Res 10K"],
+            ]
+        })
+        results = classic.evaluate_rows(
+            classic.extract_bom_rows(str(bom)),
+            classic.load_placement_values(str(top), "top")[0],
+            classic.load_placement_values(str(bot), "bot")[0],
+        )
+        return bom, top, bot, results
+
+    def test_names_are_base_plus_v1(self, files, tmp_path):
+        bom, top, bot, results = files
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        paths = classic.build_all_outputs(str(bom), str(top), str(bot), results, str(out_dir))
+        assert os.path.basename(paths["top"]) == "main BOM_TOP_v1.xlsx"
+        assert os.path.basename(paths["bot"]) == "main BOM_BOT_v1.xlsx"
+        assert os.path.basename(paths["bom"]) == "main BOM_v1.xlsx"
+        for p in paths.values():
+            assert os.path.exists(p)
+
+    def test_top_output_has_only_top_parts(self, files):
+        bom, top, bot, results = files
+        paths = classic.build_all_outputs(
+            str(bom), str(top), str(bot), results, os.path.dirname(str(bom)))
+        wb = openpyxl.load_workbook(paths["top"])
+        # شیت bot حذف، شیت top از فایل جدید
+        assert "bot" not in wb.sheetnames
+        assert "top" in wb.sheetnames
+        assert wb["top"]["A2"].value == "C1"
+        assert wb["top"]["E2"].value == 1110101
+        # شیت BOM فقط سطر قطعات لایهٔ top (قطعهٔ bot-only حذف شده)
+        ws = wb["مونتاژ ماشینی"]
+        stocks = [ws.cell(row=r, column=8).value for r in range(1, ws.max_row + 1)]
+        assert 1110101 in stocks and 1110202 not in stocks
+        # یادداشت پایانی (غیرداده) و سربرگ‌ها حفظ شده‌اند
+        assert ws["A1"].value == "F1 Co"
+        assert any("یادداشت" in str(ws.cell(row=r, column=1).value or "")
+                   for r in range(1, ws.max_row + 1))
+        # گزارش لایه وجود دارد
+        assert "Layer Report" in wb.sheetnames
+
+    def test_bot_output_has_only_bot_parts(self, files):
+        bom, top, bot, results = files
+        paths = classic.build_all_outputs(
+            str(bom), str(top), str(bot), results, os.path.dirname(str(bom)))
+        wb = openpyxl.load_workbook(paths["bot"])
+        assert "top" not in wb.sheetnames
+        assert "bot" in wb.sheetnames
+        assert wb["bot"]["A2"].value == "R1"
+        ws = wb["مونتاژ ماشینی"]
+        stocks = [ws.cell(row=r, column=8).value for r in range(1, ws.max_row + 1)]
+        assert 1110202 in stocks and 1110101 not in stocks
+
+    def test_g4_locked_in_all_outputs(self, files):
+        bom, top, bot, results = files
+        paths = classic.build_all_outputs(
+            str(bom), str(top), str(bot), results, os.path.dirname(str(bom)))
+        for p in paths.values():
+            wb = openpyxl.load_workbook(p)
+            ws = wb["مونتاژ ماشینی"]
+            assert ws["G4"].value == "P.Parsa", p
+            assert ws["G4"].protection.locked is True, p
+            assert ws["A1"].protection.locked is False, p
+            assert ws.protection.sheet is True, p
+            assert ws.protection.password, p
 
 
 class TestLicenseKeyIntegrity:
