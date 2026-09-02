@@ -41,27 +41,50 @@ HEADER_KEYWORDS = [
 # الگوهای تشخیص «سطر فیبر برد» (خود برد PCB) — بر اساس محتوا، نه شمارهٔ ردیف.
 # معمولاً آخرین ردیف BOM است ولی ممکن است جابجا شده باشد؛ پس در همهٔ سطرها
 # دنبال این الگوها می‌گردیم:
-PCB_DESIGNATOR_RE = re.compile(r"^\s*PCB\s*\d*\s*$", re.IGNORECASE)   # PCB100 ،PCB1 ،PCB
+PCB_DESIGNATOR_RE = re.compile(r"^\s*PCB[\s\-_]?\d*\s*$", re.IGNORECASE)  # PCB100 ،PCB-1 ،PCB
+PCB_DES_WORD_RE = re.compile(r"^\s*(BOARD|BRD)[\s\-_]?\d*\s*$", re.IGNORECASE)  # BOARD ،BOARD1
 PCB_PART_NAME_RE = re.compile(r"^\s*PCB\b\s*[,،;:\-_]?", re.IGNORECASE)  # «PCB, SBMi» و مانند آن
+# کلمهٔ فارسی رایج برای فیبر (در Designator یا Part Name)
+PCB_FA_KEYWORD = "فیبر"
+# ویژگیِ جنس/نوعِ خودِ فیبر: «4Layer,FR4» ،«8-layer» ،«FR4» — عبارتی که ردیف‌های
+# قطعه (SMD/X7R/…) ندارند؛ عمداً چندحرفه تا «Multilayer Ceramic» اشتباه نشود.
+PCB_TYPE_RE = re.compile(r"(?:^|[\s,/\\])fr\s*\-?\s*\d\b|\d+\s*\-?\s*layer\b", re.IGNORECASE)
+# عبارت «Board خام» در Part Name یا Part No.
+PCB_BARE_RE = re.compile(r"\b(bare|printed)\W*board\b", re.IGNORECASE)
 
 
-def is_pcb_bom_row(designator: str, part_name: str) -> bool:
+def is_pcb_bom_row(designator: str, part_name: str,
+                   type_material: str = "", part_no: str = "") -> bool:
     """
     آیا این سطر BOM همان «فیبر برد» (خود برد) است؟
 
     تشخیص محتوایی و مستقل از جایگاه سطر انجام می‌شود تا اگر ردیف جابجا شد
-    (مثلاً دیگر آخرین ردیف نبود) هم باز شناسایی شود:
+    (مثلاً دیگر آخرین ردیف نبود) هم باز شناسایی شود. هر کدام از این نشانه‌ها
+    کافی است:
 
-    * Designator به‌شکل PCB100 / PCB1 / PCB باشد، یا
-    * Part Name با «PCB» + جداکننده شروع شود (مثل «PCB, SBMi»).
+    * Designator به‌شکل PCB100 / PCB-1 / PCB باشد، یا
+    * Part Name با «PCB» + جداکننده شروع شود (مثل «PCB, SBMi»)، یا
+    * کلمهٔ فارسی «فیبر» در Designator یا Part Name باشد، یا
+    * ستون Type/Material ویژگی فیبر داشته باشد («4Layer,FR4»، «8-layer»، «FR4»)، یا
+    * عبارت «Bare/Printed Board» در Part Name یا Part No. باشد.
 
-    موارد منفیِ عمدی: «Socket,PCB Mount» یا «PCBA…» سطر فیبر به حساب نمی‌آیند.
+    موارد منفیِ عمدی: «Socket,PCB Mount» ،«PCBA…» ،«Multilayer Ceramic» یا
+    ردیف قطعه با Type=SMD/X7R سطر فیبر به حساب نمی‌آیند.
     """
     des = (designator or "").strip()
     name = (part_name or "").strip()
-    if des and PCB_DESIGNATOR_RE.match(des):
+    typ = (type_material or "").strip()
+    pno = (part_no or "").strip()
+    if des and (PCB_DESIGNATOR_RE.match(des) or PCB_DES_WORD_RE.match(des)):
         return True
-    return bool(name and PCB_PART_NAME_RE.match(name))
+    if name and PCB_PART_NAME_RE.match(name):
+        return True
+    if PCB_FA_KEYWORD in des or PCB_FA_KEYWORD in name:
+        return True
+    if typ and PCB_TYPE_RE.search(typ):
+        return True
+    blob = f"{name} {pno}"
+    return bool(PCB_BARE_RE.search(blob))
 
 
 # ---------------------------------------------------------------------------
@@ -165,12 +188,13 @@ def find_first_matching_headers(df: pd.DataFrame):
 
 
 def _scan_bom_rows(df: pd.DataFrame, header_row: int, col_part: int,
-                   col_qty: int, col_stock: int, col_des: int = -1) -> list[dict]:
+                   col_qty: int, col_stock: int, col_des: int = -1,
+                   col_type: int = -1, col_partno: int = -1) -> list[dict]:
     """
     پیمایش همهٔ سطرهای بعد از سربرگ و تشخیص «سطر داده» از «غیر داده» —
     منطق دقیقاً همان extract_data است، به‌علاوهٔ نگاشت شمارهٔ سطر و کلید تطبیق.
-    اگر col_des داده شود، مقدار Designator هر سطر هم (برای تشخیص سطر فیبر برد)
-    در خروجی آمده است.
+    اگر col_des (و در صورت وجود col_type/col_partno) داده شود، مقادیر آن‌ها هم
+    برای تشخیصِ گستردهٔ «سطر فیبر برد» در خروجی می‌آید.
     """
     rows: list[dict] = []
     for r_idx in range(header_row + 1, len(df)):
@@ -203,17 +227,20 @@ def _scan_bom_rows(df: pd.DataFrame, header_row: int, col_part: int,
             is_header_row = True
             qty_num = 0
 
-        des_str = ""
-        if 0 <= col_des < df.shape[1]:
-            des_val = df.iat[r_idx, col_des]
-            if not (pd.isna(des_val) or str(des_val).strip() == ""):
-                des_str = str(des_val).strip()
+        def _opt_cell(col: int, _r: int = r_idx) -> str:
+            if 0 <= col < df.shape[1]:
+                v = df.iat[_r, col]
+                if not (pd.isna(v) or str(v).strip() == ""):
+                    return str(v).strip()
+            return ""
 
         rows.append({
             'idx': r_idx,              # اندیس دیتافریم ⇒ سطر ورک‌شیت = idx + 1
             'Stock': stock_str,
             'Part Name': part_str,
-            'Designator': des_str,
+            'Designator': _opt_cell(col_des),
+            'Type': _opt_cell(col_type),
+            'Part No.': _opt_cell(col_partno),
             'Qty': qty_num,
             'is_data': not is_header_row,
             'key': _count_key(stock_str if stock_str else part_str),
@@ -510,10 +537,18 @@ def aggregate_layer(records: list[dict]) -> list[dict]:
 
 
 def _find_bom_columns(df: pd.DataFrame):
-    """ستون‌های BOM شامل Designator و Item — مکمل find_first_matching_headers."""
+    """
+    ستون‌های BOM شامل Designator ،Item ،Type/Material و Part No. —
+    مکمل find_first_matching_headers. ستون‌های Type/Part No. برای تشخیصِ
+    گستردهٔ «سطر فیبر برد» (مثل 4Layer,FR4) به‌کار می‌روند.
+    خروجی: (header_row, col_part, col_qty, col_stock, col_des, col_item,
+            col_type, col_partno)
+    """
     header_row, col_part, col_qty, col_stock = find_first_matching_headers(df)
     col_des = -1
     col_item = -1
+    col_type = -1
+    col_partno = -1
     if header_row != -1:
         for c_idx, val in df.iloc[header_row].items():
             if pd.isna(val):
@@ -523,9 +558,14 @@ def _find_bom_columns(df: pd.DataFrame):
                 col_des = c_idx
             elif col_item == -1 and val_str == 'item':
                 col_item = c_idx
+            elif col_type == -1 and ('type' in val_str or 'material' in val_str):
+                col_type = c_idx
+            elif col_partno == -1 and 'partno' in val_str:
+                col_partno = c_idx
     if col_item == -1:
         col_item = 0
-    return header_row, col_part, col_qty, col_stock, col_des, col_item
+    return (header_row, col_part, col_qty, col_stock, col_des, col_item,
+            col_type, col_partno)
 
 
 def _last_bom_title_col(df: pd.DataFrame, header_row: int) -> int:
@@ -572,7 +612,8 @@ def _rebuild_bom_sheet_for_layer(ws, df: pd.DataFrame, groups: list[dict]) -> di
     * ستون «pcb» بعد از آخرین عنوان BOM اضافه و شرح قطعهٔ هر کد (از فایل نقشه) در آن نوشته می‌شود
     * سربرگ/عنوان‌ها و سطرهای غیرداده دست‌نخورده می‌مانند
     """
-    header_row, col_part, col_qty, col_stock, col_des, col_item = _find_bom_columns(df)
+    (header_row, col_part, col_qty, col_stock, col_des, col_item,
+     col_type, col_partno) = _find_bom_columns(df)
     stats = {"rewritten": 0, "deleted": 0, "appended": 0,
              "pcb_kept": 0, "pcb_designators": []}
     if header_row == -1 or col_stock == -1 or col_qty == -1:
@@ -581,14 +622,19 @@ def _rebuild_bom_sheet_for_layer(ws, df: pd.DataFrame, groups: list[dict]) -> di
     pcb_col = _add_pcb_title(ws, df, header_row)   # ستون «pcb» — بعد از آخرین عنوان BOM
 
     by_key = {g['key']: g for g in groups}
-    scans = _scan_bom_rows(df, header_row, col_part, col_qty, col_stock, col_des)
+    scans = _scan_bom_rows(df, header_row, col_part, col_qty, col_stock, col_des,
+                           col_type, col_partno)
+
+    def _is_board(s: dict) -> bool:
+        return is_pcb_bom_row(s['Designator'], s['Part Name'],
+                              s.get('Type', ""), s.get('Part No.', ""))
 
     seen: set[str] = set()
     delete_ws_rows: list[int] = []
     data_rows = [s for s in scans if s['is_data']]
     for s in data_rows:
         ws_r = s['idx'] + 1
-        if is_pcb_bom_row(s['Designator'], s['Part Name']):
+        if _is_board(s):
             # «سطر فیبر برد» در هر دو خروجی TOP و BOT باید باشد؛ پس حذف نمی‌شود
             # و مقادیرش (Designator/QTY/…) عیناً از BOM اصلی می‌ماند. ستون pcb
             # هم شرح خودِ فیبر را می‌گیرد تا برای پشت و روی برد اعلام شده باشد.
@@ -613,10 +659,7 @@ def _rebuild_bom_sheet_for_layer(ws, df: pd.DataFrame, groups: list[dict]) -> di
     if new_groups and data_rows:
         # نقطهٔ درج: بعد از آخرین سطر دادهٔ «غیرِ فیبر»، تا سطر فیبر برد همیشه
         # در جای خودش (معمولاً آخرین ردیف جدول) بماند و کدهای تازه قبل از آن بیایند.
-        non_pcb_rows = [
-            s for s in data_rows
-            if not is_pcb_bom_row(s['Designator'], s['Part Name'])
-        ]
+        non_pcb_rows = [s for s in data_rows if not _is_board(s)]
         ref_row = (non_pcb_rows or data_rows)[-1]['idx'] + 1   # آخرین سطر دادهٔ اصلی
         ws.insert_rows(ref_row + 1, amount=len(new_groups))
         style_cols = {col_item, col_des, col_part, col_qty, col_stock, pcb_col - 1}
@@ -695,6 +738,9 @@ def _add_layer_report_sheet(wb, layer: str, groups: list[dict],
                f"جدید (فقط در فایل لایه): {len(groups) - in_bom}"])
     if pcb_designators:
         ws.append([f"فیبر برد (در TOP و BOT هر دو حفظ شد): {', '.join(pcb_designators)}"])
+    else:
+        ws.append(["⚠️ سطر فیبر برد در BOM شناسایی نشد — اگر برد دارای ردیف مجزاست، "
+                   "الگوی Designator/Part Name/Type آن را به توسعه‌دهنده بدهید."])
     ws.append([])
 
     header = ["Stock ID", "Part Name", "Designator Count", "Designators", "In Original BOM"]

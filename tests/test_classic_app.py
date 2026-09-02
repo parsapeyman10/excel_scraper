@@ -646,15 +646,77 @@ class TestPcbBoardRow:
         # موارد مثبت — مستقل از جایگاه ردیف
         assert f("PCB100", "")
         assert f(" pcb 7 ", "")
+        assert f("PCB-100", "")
         assert f("", "PCB, SBMi")
         assert f("", "PCB، X")                 # کامای فارسی
         assert f("", "PCB")
+        # نشانه‌های جایگزین (وقتی Designator/Name سبک PCB ندارند)
+        assert f("", "فیبر برد مدار چاپی")      # کلمهٔ فارسی
+        assert f("BOARD", "")
+        assert f("P1", "SBMi_F1K_B2", "4Layer,FR4")   # Type ویژهٔ فیبر
+        assert f("P2", "main board", "FR4")
+        assert f("P3", "panel", "8-layer stackup")
+        assert f("", "Bare Board, SBMi")
+        assert f("", "anything", "", "SBMi bare-board rev2")
         # موارد منفی — اشتباه گرفته نشوند
         assert not f("C100", "Cap 47N")
         assert not f("", "Socket,PCB Mount")
         assert not f("", "PCBA, assembled")    # PCBA با PCB یکی نیست
         assert not f("", "Res 10K")
         assert not f("", "")
+        assert not f("C1", "Cap,MLCC", "Ceramic Multilayer")   # Multilayer ≠ layer فیبر
+        assert not f("R1", "Res 10K", "SMD")
+        assert not f("J1", "Board-to-Board connector", "SMD")  # کانکتور، نه برد
+        assert not f("U1", "IC, MCU", "SMD", "R7F7015834AFP")
+
+    def test_board_row_without_pcb_labels_kept_in_both(self, tmp_path):
+        """فیبری که نه PCB در نام دارد و نه Designatorِ PCB — فقط Type=4Layer,FR4."""
+        cap = [1, "C1-C2", "Cap 47N", "PN1", "X7R", "0603", 3, 1110101]
+        resw = [2, "R1", "Res 10K", "PN2", "R", "0603", 2, 1110202]
+        pcb = ["70", "P1", "SBMi_F1K_B2", "SBMi_F1K_B2",
+               "4Layer,FR4", "130 x 150 x 1.6mm", "1", 1100468]
+        bom = self._write_xlsx(tmp_path / "main BOM.xlsx", {
+            "مونتاژ ماشینی": [
+                ["F1 Co", None, "Provided by:", None, None, None, None, None],
+                [None] * 8, [None] * 8, [None] * 8, [None] * 8, [None] * 8,
+                [None] * 8,
+                ["Item", "Designator", "Part Name", "Part No.",
+                 "Type", "Size", "QTY", "Brand"],
+                [None, None, None, None, None, None, None, "Stock No."],
+                cap, pcb, resw,      # فیبر حتی وسطِ جدول
+                ["یادداشت پایانی", None, None, None, None, None, None, None],
+            ],
+            "top": [["old", "top"]],
+            "bot": [["old", "bot"]],
+        })
+        top = self._write_xlsx(tmp_path / "top.xlsx", {
+            "top": [
+                ["Designator", "Center-X(mm)", "Center-Y(mm)", "Rotation",
+                 "SPCO Stock Number", "Description"],
+                ["C1", 10.5, 20.5, 90, 1110101, "Cap 47N"],
+            ]
+        })
+        bot = self._write_xlsx(tmp_path / "bot.xlsx", {
+            "bot": [
+                ["Designator", "Center-X(mm)", "Center-Y(mm)", "Rotation",
+                 "SPCO Stock Number", "Description"],
+                ["R1", 30.0, 40.0, 180, 1110202, "Res 10K"],
+            ]
+        })
+        results = classic.evaluate_rows(
+            classic.extract_bom_rows(str(bom)),
+            classic.load_placement_values(str(top), "top")[0],
+            classic.load_placement_values(str(bot), "bot")[0],
+        )
+        paths = classic.build_all_outputs(
+            str(bom), str(top), str(bot), results, str(tmp_path))
+        for key in ("top", "bot"):
+            wb = openpyxl.load_workbook(paths[key])
+            rows = self._rows(wb["مونتاژ ماشینی"])
+            by_stock = {r[1]: r for r in rows}
+            assert 1100468 in by_stock, f"{key}: فیبر برد گم شده"
+            assert by_stock[1100468][3] == "P1"          # Designator دست‌نخورده
+            assert [r[1] for r in rows].count(1100468) == 1
 
     @pytest.mark.parametrize("pcb_position", ["last", "middle"])
     def test_pcb_row_kept_in_both_layers(self, tmp_path, pcb_position):
