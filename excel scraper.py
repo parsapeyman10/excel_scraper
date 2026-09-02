@@ -23,12 +23,14 @@ BOM Integrity & Placement Validator — نسخهٔ کلاسیک تکامل‌ی�
 
 from __future__ import annotations
 
+import contextlib
+import glob
 import os
 import sys
 
 import pandas as pd
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QColor, QFont, QGuiApplication
+from PyQt6.QtGui import QColor, QFont, QGuiApplication, QIcon
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -69,6 +71,27 @@ from bom_classic_core import (
 
 APP_VERSION = "2.1.0"
 APP_TITLE = "BOM Integrity & Placement Validator"
+# نام فایلِ اصلیِ آیکونِ کاربر (در صورت عدم تبدیل به app_icon.* هنگام ساخت exe)
+ICON_BASE_NAME = "web-data-scraping-icon-svg-download-png-3587064"
+
+
+def _resource_path(name: str) -> str:
+    """مسیر یک منبع — هم در حالت توسعه و هم داخل exe (پوشهٔ موقت PyInstaller)."""
+    base = getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, name)
+
+
+def load_app_icon() -> QIcon:
+    """
+    آیکون برنامه برای پنجره/تسک‌بار: ابتدا فایل استانداردِ تزریق‌شده هنگام
+    ساخت exe (app_icon.png / app_icon.ico)، سپس فایل خام با نام اصلیِ دانلودشده.
+    """
+    for cand in ("app_icon.png", "app_icon.ico"):
+        path = _resource_path(cand)
+        if os.path.exists(path):
+            return QIcon(path)
+    matches = sorted(glob.glob(_resource_path(ICON_BASE_NAME + ".*")))
+    return QIcon(matches[0]) if matches else QIcon()
 
 
 # ---------------------------------------------------------------------------
@@ -938,6 +961,17 @@ def ensure_license() -> bool:
 def main(argv: list[str] | None = None) -> int:
     app = QApplication(argv if argv is not None else sys.argv)
 
+    icon = load_app_icon()
+    if not icon.isNull():
+        app.setWindowIcon(icon)
+
+    if sys.platform == "win32":
+        # شناسهٔ یکتا برای ویندوز تا آیکون تسک‌بار درست گروه‌بندی و نمایش داده شود
+        with contextlib.suppress(Exception):
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                f"SPCO.BOMValidator.{APP_VERSION}")
+
     font = app.font()
     font.setFamily("Tahoma")
     font.setPointSize(9)
@@ -948,6 +982,8 @@ def main(argv: list[str] | None = None) -> int:
         "QToolTip { background:#1B2432; color:#E5E9F0; border:1px solid #2A3550; }")
 
     window = IndustrialBOMValidator()
+    if not icon.isNull():
+        window.setWindowIcon(icon)
     window.show()
 
     # پس از نمایش پنجره: اگر دورهٔ آزمایشی تمام و لایسنسی نیست، فعال‌سازی اجباری است

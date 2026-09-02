@@ -19,6 +19,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
 import bom_classic_core as classic  # noqa: E402  — منطق اصلی برنامه (بدون Qt)
+import build_icons  # noqa: E402  — آماده‌سازی آیکون ساخت exe
 import license_core  # noqa: E402
 
 
@@ -742,3 +743,55 @@ class TestLicenseKeyIntegrity:
         assert payload["dev"] == dev
         assert payload["plan"] == "M1"
         assert payload["exp"] - payload["iat"] == 30 * 86400
+
+
+class TestBuildIcons:
+    """آماده‌سازی آیکون برای ساخت exe — یافتن فایلِ نام‌آشنا و تبدیل به ICO."""
+
+    def test_find_icon_missing(self, tmp_path):
+        assert build_icons.find_icon_file(str(tmp_path)) is None
+
+    def test_find_users_download_name(self, tmp_path):
+        f = tmp_path / "web-data-scraping-icon-svg-download-png-3587064.png"
+        f.write_bytes(b"not-really-an-image")
+        assert build_icons.find_icon_file(str(tmp_path)) == str(f)
+
+    def test_app_icon_name_preferred(self, tmp_path):
+        long_f = tmp_path / "web-data-scraping-icon-svg-download-png-3587064.png"
+        short_f = tmp_path / "app_icon.ico"
+        long_f.write_bytes(b"a")
+        short_f.write_bytes(b"b")
+        assert build_icons.find_icon_file(str(tmp_path)) == str(short_f)
+
+    def test_png_to_ico_header(self, tmp_path):
+        pytest.importorskip("PIL")
+        from PIL import Image
+        src = tmp_path / "app_icon.png"
+        Image.new("RGBA", (32, 32), (255, 0, 0, 255)).save(src)
+        dst = build_icons.png_to_ico(str(src), str(tmp_path / "app_icon.ico"))
+        assert Path(dst).read_bytes()[:4] == b"\x00\x00\x01\x00"   # جادوی فایل ICO
+
+    def test_prepare_icons_from_users_png(self, tmp_path):
+        pytest.importorskip("PIL")
+        from PIL import Image
+        src = tmp_path / "web-data-scraping-icon-svg-download-png-3587064.png"
+        Image.new("RGBA", (64, 64), (0, 255, 0, 255)).save(src)
+        out = tmp_path / "assets"
+        icons = build_icons.prepare_icons(str(tmp_path), str(out))
+        # آیکون exe به‌صورت ICO تبدیل شده و فایل Runtime با نام ثابت app_icon.png است
+        assert Path(icons["exe_icon"]).name == "app_icon.ico"
+        assert Path(icons["exe_icon"]).exists()
+        assert Path(icons["runtime_icon"]).name == "app_icon.png"
+        assert Path(icons["runtime_icon"]).parent == out
+
+    def test_prepare_icons_ico_passthrough(self, tmp_path):
+        src = tmp_path / "app_icon.ico"
+        src.write_bytes(b"\x00\x00\x01\x00fake-ico-bytes")
+        icons = build_icons.prepare_icons(str(tmp_path), str(tmp_path / "assets"))
+        # بدون نیاز به تبدیل/بدون Pillow
+        assert icons["exe_icon"] == str(src)
+        assert Path(icons["runtime_icon"]).name == "app_icon.ico"
+
+    def test_prepare_icons_missing(self, tmp_path):
+        icons = build_icons.prepare_icons(str(tmp_path), str(tmp_path / "assets"))
+        assert icons == {"exe_icon": None, "runtime_icon": None}
