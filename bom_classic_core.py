@@ -493,6 +493,36 @@ def _find_bom_columns(df: pd.DataFrame):
     return header_row, col_part, col_qty, col_stock, col_des, col_item
 
 
+def _last_bom_title_col(df: pd.DataFrame, header_row: int) -> int:
+    """
+    آخرین ستونِ دارای عنوان در ناحیهٔ عنوان BOM (از ردیف اول تا زیرسربرگ) — به‌صورت پویا،
+    چون در فایل‌های مختلف ممکن است جای متفاوتی باشد ولی معمولاً آخرین ردیف/ستون BOM است.
+    خروجی: اندیس ستون (۰-مبنا، قالب دیتافریم).
+    """
+    last_title = 0
+    end = min(header_row + 1, len(df) - 1)
+    for r in range(0, end + 1):
+        for c_idx, val in df.iloc[r].items():
+            if pd.notna(val) and str(val).strip() != "":
+                last_title = max(last_title, c_idx)
+    return last_title
+
+
+def _add_pcb_title(ws, df: pd.DataFrame, header_row: int) -> int:
+    """عنوان «pcb» را بلافاصله بعد از آخرین عنوان BOM می‌نویسد؛ شمارهٔ ستون ورک‌شیت را برمی‌گرداند."""
+    last_title = _last_bom_title_col(df, header_row)
+    pcb_col = last_title + 2                      # ورک‌شیت = دیتافریم + ۱، و خود ستون pcb یکی جلوتر
+    head_ws_row = header_row + 1
+    hcell = ws.cell(row=head_ws_row, column=pcb_col)
+    hcell.value = "pcb"
+    with contextlib.suppress(Exception):
+        hcell._style = copy(ws.cell(row=head_ws_row, column=pcb_col - 1)._style)
+    with contextlib.suppress(Exception):
+        ws.column_dimensions[hcell.column_letter].width = max(
+            34, ws.column_dimensions[hcell.column_letter].width or 0)
+    return pcb_col
+
+
 def _rebuild_bom_sheet_for_layer(ws, df: pd.DataFrame, groups: list[dict]) -> dict:
     """
     بازسازی شیت BOM مخصوص یک لایه:
@@ -501,12 +531,15 @@ def _rebuild_bom_sheet_for_layer(ws, df: pd.DataFrame, groups: list[dict]) -> di
       و QTY = تعداد واقعی آن‌ها در این لایه
     * سطرهای تکراریِ یک کد انبار (در BOM اصلی) ادغام می‌شوند
     * کدهایی که در BOM اصلی نیستند اما در لایه هستند، به انتهای جدول اضافه می‌شوند
+    * ستون «pcb» بعد از آخرین عنوان BOM اضافه و شرح قطعهٔ هر کد (از فایل نقشه) در آن نوشته می‌شود
     * سربرگ/عنوان‌ها و سطرهای غیرداده دست‌نخورده می‌مانند
     """
     header_row, col_part, col_qty, col_stock, col_des, col_item = _find_bom_columns(df)
     stats = {"rewritten": 0, "deleted": 0, "appended": 0}
     if header_row == -1 or col_stock == -1 or col_qty == -1:
         return stats
+
+    pcb_col = _add_pcb_title(ws, df, header_row)   # ستون «pcb» — بعد از آخرین عنوان BOM
 
     by_key = {g['key']: g for g in groups}
     scans = _scan_bom_rows(df, header_row, col_part, col_qty, col_stock)
@@ -524,6 +557,7 @@ def _rebuild_bom_sheet_for_layer(ws, df: pd.DataFrame, groups: list[dict]) -> di
         ws.cell(row=ws_r, column=col_qty + 1).value = len(g['designators'])
         if col_des != -1:
             ws.cell(row=ws_r, column=col_des + 1).value = ", ".join(g['designators'])
+        ws.cell(row=ws_r, column=pcb_col).value = g['description'] or s['Part Name']
         stats["rewritten"] += 1
 
     # افزودن کدهای انبارِ موجود در لایه ولی غایب از BOM اصلی
@@ -531,16 +565,14 @@ def _rebuild_bom_sheet_for_layer(ws, df: pd.DataFrame, groups: list[dict]) -> di
     if new_groups and data_rows:
         ref_row = data_rows[-1]['idx'] + 1          # آخرین سطر دادهٔ اصلی (قبل از حذف‌ها)
         ws.insert_rows(ref_row + 1, amount=len(new_groups))
-        style_cols = {col_item, col_des, col_part, col_qty, col_stock}
+        style_cols = {col_item, col_des, col_part, col_qty, col_stock, pcb_col - 1}
         for offset, g in enumerate(new_groups):
             row = ref_row + 1 + offset
             for c in style_cols:
                 if c == -1:
                     continue
-                try:
+                with contextlib.suppress(Exception):
                     ws.cell(row=row, column=c + 1)._style = copy(ws.cell(row=ref_row, column=c + 1)._style)
-                except Exception:
-                    pass
             if col_des != -1:
                 ws.cell(row=row, column=col_des + 1).value = ", ".join(g['designators'])
             if col_part != -1:
@@ -550,6 +582,7 @@ def _rebuild_bom_sheet_for_layer(ws, df: pd.DataFrame, groups: list[dict]) -> di
             if isinstance(stock_val, str) and stock_val.isdigit():
                 stock_val = int(stock_val)   # هم‌نوع با سلول‌های کد انبار در BOM
             ws.cell(row=row, column=col_stock + 1).value = stock_val
+            ws.cell(row=row, column=pcb_col).value = g['description']
             stats["appended"] += 1
 
     # حذف سطرها از پایین به بالا (شماره‌ها مبتنی بر ساختار اصلی، زیر نقطهٔ درج)

@@ -428,7 +428,7 @@ class TestThreeOutputs:
         return bom, top, bot, results
 
     def _data_rows(self, ws):
-        """(stock, qty, designator, part, item) برای سطرهایی که ستون ۸ عدد دارند."""
+        """(stock, qty, designator, part, item, pcb) برای سطرهایی که ستون ۸ عدد دارند."""
         out = []
         for r in range(1, ws.max_row + 1):
             stock = ws.cell(row=r, column=8).value
@@ -436,7 +436,8 @@ class TestThreeOutputs:
                 out.append((int(stock), ws.cell(row=r, column=7).value,
                             ws.cell(row=r, column=2).value,
                             ws.cell(row=r, column=3).value,
-                            ws.cell(row=r, column=1).value))
+                            ws.cell(row=r, column=1).value,
+                            ws.cell(row=r, column=9).value))
         return out
 
     def test_names_are_base_plus_v1(self, files, tmp_path):
@@ -479,7 +480,11 @@ class TestThreeOutputs:
         assert by_stock[1110999][4] == 2
         # ۴) قطعهٔ bot-only حذف شده
         assert 1110202 not in by_stock
-        # ۵) سربرگ/عنوان و یادداشت غیرداده حفظ شده
+        # ۵) ستون «pcb» بلافاصله بعد از آخرین عنوان BOM (ستون ۹) و پر از شرح قطعهٔ نقشه
+        assert ws.cell(row=8, column=9).value == "pcb"
+        assert by_stock[1110101][5] == "Cap 47N"
+        assert by_stock[1110999][5] == "LED RED"
+        # ۶) سربرگ/عنوان و یادداشت غیرداده حفظ شده
         assert ws["A1"].value == "F1 Co"
         assert any("یادداشت" in str(ws.cell(row=r, column=1).value or "")
                    for r in range(1, ws.max_row + 1))
@@ -500,6 +505,8 @@ class TestThreeOutputs:
         assert 1110101 not in by_stock
         assert by_stock[1110202][1] == 2
         assert by_stock[1110202][2] == "R1, R3"
+        assert ws.cell(row=8, column=9).value == "pcb"
+        assert by_stock[1110202][5] == "Res 10K"
 
     def test_g4_locked_in_all_outputs(self, files):
         bom, top, bot, results = files
