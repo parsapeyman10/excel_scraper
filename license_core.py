@@ -497,6 +497,17 @@ def deactivate() -> None:
     _store_delete("license")
 
 
+def license_ui_visible(state: LicenseState) -> bool:
+    """
+    آیا نشانه‌های لایسنس باید در پنجرهٔ کاربری دیده شوند؟
+
+    تا وقتی وضعیت لایسنس عادی است (لایسنس فعال «ok» یا دورهٔ آزمایشی «trial»)،
+    هیچ نشانه‌ای — نه تب لایسنس و نه نشان وضعیت — در پنجره دیده نمی‌شود.
+    فقط پس از انقضا/خرابی ظاهر می‌شود و با فعال‌سازی موفق دوباره پنهان خواهد شد.
+    """
+    return not state.ok
+
+
 def days_to_expiry() -> int | None:
     state = current_state()
     return state.days_left if state.ok else None

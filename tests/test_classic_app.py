@@ -173,6 +173,46 @@ class TestTrial:
         assert state.ok and state.code == "ok"
 
 
+class TestLicenseUiVisibility:
+    """
+    قاعدهٔ نمایش لایسنس در پنجرهٔ کاربری: تا وقتی لایسنس وضعیت عادی دارد
+    (لایسنس فعال یا دورهٔ آزمایشی) هیچ نشانه‌ای دیده نمی‌شود؛ فقط پس از
+    انقضا/خرابی ظاهر و پس از فعال‌سازی موفق دوباره پنهان می‌شود.
+    """
+
+    def test_hidden_during_trial(self):
+        state = license_core.current_state()
+        assert state.code == "trial"
+        assert not license_core.license_ui_visible(state)
+
+    def test_hidden_with_active_license(self):
+        key = license_core.build_license_key(license_core.get_device_id_raw(), months=3)
+        assert license_core.activate(key).ok
+        state = license_core.current_state()
+        assert state.code == "ok"
+        assert not license_core.license_ui_visible(state)
+
+    def test_visible_after_trial_expires(self):
+        license_core._store_set(
+            "trial", license_core._seal_trial_stamp(int(time.time() - 31 * 86400)))
+        state = license_core.current_state()
+        assert state.code == "trial_expired"
+        assert license_core.license_ui_visible(state)
+
+    def test_visible_on_tampered_data(self):
+        license_core._store_set("trial", "1234567890.deadbeef")
+        assert license_core.license_ui_visible(license_core.current_state())
+
+    def test_hidden_again_after_activation(self):
+        # انقضا → علایم ظاهر می‌شوند؛ فعال‌سازی موفق → دوباره پنهان می‌شوند
+        license_core._store_set(
+            "trial", license_core._seal_trial_stamp(int(time.time() - 40 * 86400)))
+        assert license_core.license_ui_visible(license_core.current_state())
+        key = license_core.build_license_key(license_core.get_device_id_raw(), months=6)
+        assert license_core.activate(key).ok
+        assert not license_core.license_ui_visible(license_core.current_state())
+
+
 # ---------------------------------------------------------------------------
 # منطق Excel کلاسیک
 # ---------------------------------------------------------------------------

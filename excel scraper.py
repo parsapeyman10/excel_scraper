@@ -13,7 +13,9 @@ BOM Integrity & Placement Validator — نسخهٔ کلاسیک تکامل‌ی�
        مختصات PCB) از فایل‌های جدید داخلش قرار می‌گیرد + شیت گزارش اعتبارسنجی
 * **رابط کاربری مدرن‌تر** با کارت‌های آماری، جست‌وجوی زنده، انتخاب همه و نوار پیشرفت
 * **سیستم لایسنس تک‌کاربره** بر اساس Device ID (۱/۳/۶ ماهه) — بدون لایسنس معتبر
-  برنامه اجرا نمی‌شود (ماژول license_core.py و ابزار مالک license_generator.py)
+  برنامه اجرا نمی‌شود (ماژول license_core.py و ابزار مالک license_generator.py).
+  تا وقتی لایسنس وضعیت عادی دارد (فعال یا دورهٔ آزمایشی) هیچ نشانه‌ای از لایسنس
+  در پنجره دیده نمی‌شود؛ فقط پس از انقضا ظاهر و پس از فعال‌سازی دوباره پنهان می‌شود
 
 اجرا:
     python "excel scraper.py"
@@ -274,7 +276,7 @@ class IndustrialBOMValidator(QMainWindow):
         self.tabs = QTabWidget()
         self.tabs.addTab(self._build_single_tab(), "📄 حالت تک‌فایل (BOM کامل)")
         self.tabs.addTab(self._build_triple_tab(), "📑 حالت سه‌فایل (BOM + TOP + BOT)")
-        self.tabs.addTab(self._build_license_tab(), "🔐 لایسنس")
+        self.license_tab_index = self.tabs.addTab(self._build_license_tab(), "🔐 لایسنس")
         self.tabs.currentChanged.connect(self._on_tab_change)
         main_layout.addWidget(self.tabs)
 
@@ -488,6 +490,7 @@ class IndustrialBOMValidator(QMainWindow):
             self.lbl_license_msg.setStyleSheet("color:#34D399;")
             self.lbl_license_msg.setText("لایسنس با موفقیت فعال شد.")
             self.ed_license_key.clear()
+            self.status_bar.showMessage("لایسنس با موفقیت فعال شد.")
         else:
             self.lbl_license_msg.setStyleSheet("color:#F87171;")
             self.lbl_license_msg.setText(f"خطا: {state.reason}")
@@ -581,12 +584,35 @@ class IndustrialBOMValidator(QMainWindow):
 
     # -- لایسنس ------------------------------------------------------
     def refresh_license_badge(self) -> None:
+        """پنهان/آشکارسازی نشانه‌های لایسنس بر اساس وضعیت فعلی.
+
+        تا وقتی لایسنس وضعیت عادی دارد (لایسنس فعال یا دورهٔ آزمایشی)،
+        هیچ نشانه‌ای از لایسنس — نه تب «🔐 لایسنس» و نه دکمهٔ وضعیت —
+        در پنجره دیده نمی‌شود. فقط پس از انقضا یا هر مشکلی در لایسنس،
+        علایم ظاهر می‌شوند و با فعال‌سازی موفق دوباره پنهان خواهند شد."""
         state = license_core.current_state()
+        show = license_core.license_ui_visible(state)
         icons = {"ok": "🔓", "trial": "🧪"}
         icon = icons.get(state.code, "🔒")
-        self.badge_license.setText(f"{icon} {state.short_label}")
+
+        # نشان/دکمهٔ نوار بالایی فقط هنگام مشکل لایسنس نمایان است
+        self.badge_license.setVisible(show)
+        if show:
+            self.badge_license.setText(f"{icon} {state.short_label}")
+
+        # تب لایسنس هم فقط هنگام مشکل نمایان است
+        if hasattr(self, "license_tab_index"):
+            bar = self.tabs.tabBar()
+            was_visible = bar.isTabVisible(self.license_tab_index)
+            bar.setTabVisible(self.license_tab_index, show)
+            if show and not was_visible:
+                # تازه پدیدار شد → کاربر را همانجا ببریم تا فعال‌سازی کند
+                self.tabs.setCurrentIndex(self.license_tab_index)
+            elif not show and self.tabs.currentIndex() == self.license_tab_index:
+                self.tabs.setCurrentIndex(0)
+
         self.setWindowTitle(f"{APP_TITLE} — v{APP_VERSION}")
-        # به‌روزرسانی تب لایسنس
+        # به‌روزرسانی محتوای تب لایسنس (برای وقتی نمایان است)
         if hasattr(self, "lbl_license_status"):
             colors = {"ok": "#34D399", "trial": "#FBBF24"}
             color = colors.get(state.code, "#F87171")
@@ -602,8 +628,9 @@ class IndustrialBOMValidator(QMainWindow):
             return True
         dlg = ActivationDialog(state, parent=self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
-            self.refresh_license_badge()
+            self.refresh_license_badge()   # فعال‌سازی موفق → نشانه‌ها دوباره پنهان
             return True
+        self.refresh_license_badge()       # انقضا حین کار → علایم ظاهر شود
         self.status_bar.showMessage("عملیات لغو شد: لایسنس معتبر نیست.")
         return False
 
@@ -871,13 +898,16 @@ class IndustrialBOMValidator(QMainWindow):
         self.status_bar.showMessage(f"{len(fails)} مورد FAIL در کلیپ‌بورد کپی شد.")
 
     def _on_tab_change(self, index: int) -> None:
-        if index != 1:
-            self.btn_export.setEnabled(False)
-        else:
+        if index == 1:
             self.btn_export.setEnabled(bool(self.results_cache))
-        self.status_bar.showMessage(
-            "حالت تک‌فایل فعال است." if index == 0 else "حالت سه‌فایل فعال است."
-        )
+            self.status_bar.showMessage("حالت سه‌فایل فعال است.")
+        elif index == 0:
+            self.btn_export.setEnabled(False)
+            self.status_bar.showMessage("حالت تک‌فایل فعال است.")
+        else:
+            # تب لایسنس (فقط هنگام انقضا/مشکل لایسنس نمایان است)
+            self.btn_export.setEnabled(False)
+            self.status_bar.showMessage("برای ادامهٔ کار، لایسنس را فعال کنید.")
 
     def _set_busy(self, busy: bool, message: str = "") -> None:
         self.progress.setVisible(busy)
@@ -923,6 +953,8 @@ def main(argv: list[str] | None = None) -> int:
     # پس از نمایش پنجره: اگر دورهٔ آزمایشی تمام و لایسنسی نیست، فعال‌سازی اجباری است
     if not ensure_license():
         return 0
+    # فعال‌سازی موفق (یا لایسنسِ از قبل سالم) → هیچ نشانه‌ای از لایسنس دیده نشود
+    window.refresh_license_badge()
 
     return app.exec()
 
