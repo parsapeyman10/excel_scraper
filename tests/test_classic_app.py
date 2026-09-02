@@ -522,6 +522,166 @@ class TestThreeOutputs:
             assert ws.protection.password, p
 
 
+class TestPcbBoardRow:
+    """
+    سطر «فیبر برد» (Designator=PCB100 / Part Name=«PCB, …») باید در TOP و BOT
+    هر دو حفظ شود — حتی اگر جایگاهش در BOM جابجا شده باشد (تشخیص محتوایی).
+    """
+
+    def _write_xlsx(self, path: Path, sheets: dict[str, list[list]]) -> Path:
+        wb = openpyxl.Workbook()
+        first = True
+        for name, rows in sheets.items():
+            ws = wb.active if first else wb.create_sheet(name)
+            ws.title = name
+            first = False
+            for row in rows:
+                ws.append(row)
+        wb.save(path)
+        return path
+
+    def _make_files(self, tmp_path, pcb_position: str = "last"):
+        cap = [1, "C1-C2", "Cap 47N", "PN1", "X7R", "0603", 3, 1110101]
+        res = [2, "R1", "Res 10K", "PN2", "R", "0603", 2, 1110202]
+        # مثل فایل واقعی، مقادیر سطر فیبر به‌صورت متن ذخیره شده‌اند ('70' / '1')
+        pcb = ["70", "PCB100", "PCB, SBMi", "SBMi_F1K_B2",
+               "4Layer,FR4", "130 x 150 x 1.6mm", "1", 1100468]
+        data = [cap, res, pcb] if pcb_position == "last" else [cap, pcb, res]
+        bom = self._write_xlsx(tmp_path / "main BOM.xlsx", {
+            "مونتاژ ماشینی": [
+                ["F1 Co", None, "Provided by:", None, None, None, None, None],
+                [None] * 8, [None] * 8, [None] * 8, [None] * 8, [None] * 8,
+                [None] * 8,
+                ["Item", "Designator", "Part Name", "Part No.",
+                 "Type", "Size", "QTY", "Brand"],
+                [None, None, None, None, None, None, None, "Stock No."],
+                *data,
+                ["یادداشت پایانی", None, None, None, None, None, None, None],
+            ],
+            "top": [["old", "top"]],
+            "bot": [["old", "bot"]],
+        })
+        top = self._write_xlsx(tmp_path / "top.xlsx", {
+            "top": [
+                ["Designator", "Center-X(mm)", "Center-Y(mm)", "Rotation",
+                 "SPCO Stock Number", "Description"],
+                ["C1", 10.5, 20.5, 90, 1110101, "Cap 47N"],
+                ["C2", 11.5, 21.5, 270, 1110101, "Cap 47N"],
+                ["C7", 15.0, 25.0, 0, 1110999, "LED RED"],   # کد انبار تازه
+            ]
+        })
+        bot = self._write_xlsx(tmp_path / "bot.xlsx", {
+            "bot": [
+                ["Designator", "Center-X(mm)", "Center-Y(mm)", "Rotation",
+                 "SPCO Stock Number", "Description"],
+                ["R1", 30.0, 40.0, 180, 1110202, "Res 10K"],
+                ["R3", 31.0, 41.0, 90, 1110202, "Res 10K"],
+            ]
+        })
+        results = classic.evaluate_rows(
+            classic.extract_bom_rows(str(bom)),
+            classic.load_placement_values(str(top), "top")[0],
+            classic.load_placement_values(str(bot), "bot")[0],
+        )
+        return bom, top, bot, results
+
+    @staticmethod
+    def _rows(ws):
+        """(row, stock, qty, designator, part, part_no, item, pcb) سطرهای داده."""
+        out = []
+        for r in range(1, ws.max_row + 1):
+            stock = ws.cell(row=r, column=8).value
+            if isinstance(stock, (int, float)):
+                out.append((r, int(stock), ws.cell(row=r, column=7).value,
+                            ws.cell(row=r, column=2).value,
+                            ws.cell(row=r, column=3).value,
+                            ws.cell(row=r, column=4).value,
+                            ws.cell(row=r, column=1).value,
+                            ws.cell(row=r, column=9).value))
+        return out
+
+    def test_is_pcb_bom_row_patterns(self):
+        f = classic.is_pcb_bom_row
+        # موارد مثبت — مستقل از جایگاه ردیف
+        assert f("PCB100", "")
+        assert f(" pcb 7 ", "")
+        assert f("", "PCB, SBMi")
+        assert f("", "PCB، X")                 # کامای فارسی
+        assert f("", "PCB")
+        # موارد منفی — اشتباه گرفته نشوند
+        assert not f("C100", "Cap 47N")
+        assert not f("", "Socket,PCB Mount")
+        assert not f("", "PCBA, assembled")    # PCBA با PCB یکی نیست
+        assert not f("", "Res 10K")
+        assert not f("", "")
+
+    @pytest.mark.parametrize("pcb_position", ["last", "middle"])
+    def test_pcb_row_kept_in_both_layers(self, tmp_path, pcb_position):
+        bom, top, bot, results = self._make_files(tmp_path, pcb_position)
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        paths = classic.build_all_outputs(
+            str(bom), str(top), str(bot), results, str(out_dir))
+
+        for key in ("top", "bot"):
+            wb = openpyxl.load_workbook(paths[key])
+            ws = wb["مونتاژ ماشینی"]
+            rows = self._rows(ws)
+            by_stock = {r[1]: r for r in rows}
+
+            # ۱) سطر فیبر برد حذف نشده و دقیقاً یک‌بار آمده
+            assert 1100468 in by_stock, f"{key}: فیبر برد گم شده"
+            assert [r[1] for r in rows].count(1100468) == 1
+
+            pcb = by_stock[1100468]
+            # ۲) مقادیرش عیناً از BOM اصلی مانده (دست‌نخورده)
+            assert pcb[3] == "PCB100"                    # Designator
+            assert str(pcb[2]).strip() == "1"            # QTY واقعی خود فیبر
+            assert pcb[4] == "PCB, SBMi"                 # Part Name
+            assert pcb[5] == "SBMi_F1K_B2"               # Part No.
+            # ۳) ستون pcb هم شرح فیبر را اعلام می‌کند
+            assert pcb[7] == "PCB, SBMi"
+
+            # ۴) شماره‌گذاری Item پشت‌سر و بدون شکاف، شامل سطر فیبر
+            items = sorted(r[6] for r in rows)
+            assert items == list(range(1, len(rows) + 1)), items
+
+        # ۵) در هر دو لایه قطعاتِ فقط-لایهٔ-مقابل حذف شده‌اند، ولی فیبر مانده
+        wb_top = openpyxl.load_workbook(paths["top"])
+        top_stocks = {r[1] for r in self._rows(wb_top["مونتاژ ماشینی"])}
+        assert 1110202 not in top_stocks and 1100468 in top_stocks
+        wb_bot = openpyxl.load_workbook(paths["bot"])
+        bot_stocks = {r[1] for r in self._rows(wb_bot["مونتاژ ماشینی"])}
+        assert 1110101 not in bot_stocks and 1100468 in bot_stocks
+
+        # ۶) یادداشت غیرداده همچنان حفظ است
+        assert any("یادداشت" in str(wb_top["مونتاژ ماشینی"].cell(row=r, column=1).value or "")
+                   for r in range(1, wb_top["مونتاژ ماشینی"].max_row + 1))
+
+    def test_pcb_row_stays_below_new_appended_stocks(self, tmp_path):
+        """وقتی فیبر آخرین ردیف است، کدهای تازهٔ لایه قبل از آن درج می‌شوند."""
+        bom, top, bot, results = self._make_files(tmp_path, "last")
+        paths = classic.build_all_outputs(
+            str(bom), str(top), str(bot), results, str(tmp_path))
+        wb = openpyxl.load_workbook(paths["top"])
+        rows = self._rows(wb["مونتاژ ماشینی"])
+        by_stock = {r[1]: r for r in rows}
+        assert 1110999 in by_stock                  # کد تازهٔ top درج شده
+        assert by_stock[1110999][0] < by_stock[1100468][0]   # قبل از سطر فیبر
+        assert by_stock[1100468][0] == max(r[0] for r in rows)  # فیبر آخرین داده
+        assert by_stock[1100468][6] == len(rows)      # و آخرین شمارهٔ Item
+
+    def test_layer_report_mentions_pcb(self, tmp_path):
+        bom, top, bot, results = self._make_files(tmp_path)
+        paths = classic.build_all_outputs(
+            str(bom), str(top), str(bot), results, str(tmp_path))
+        wb = openpyxl.load_workbook(paths["top"])
+        report = wb["Layer Report"]
+        texts = [str(report.cell(row=r, column=1).value or "")
+                 for r in range(1, report.max_row + 1)]
+        assert any("فیبر برد" in t and "PCB100" in t for t in texts)
+
+
 class TestLicenseKeyIntegrity:
     """اطمینان از اینکه payload بدون دسترسی به کلید مخفی قابل جعل نیست."""
 

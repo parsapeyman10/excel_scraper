@@ -19,6 +19,7 @@ import collections
 import contextlib
 import datetime
 import os
+import re
 from copy import copy
 
 import openpyxl
@@ -36,6 +37,31 @@ HEADER_KEYWORDS = [
     'part description', 'description', 'qty', 'quantity',
     'total required', 'verification', 'ref', 'designator', 'item',
 ]
+
+# الگوهای تشخیص «سطر فیبر برد» (خود برد PCB) — بر اساس محتوا، نه شمارهٔ ردیف.
+# معمولاً آخرین ردیف BOM است ولی ممکن است جابجا شده باشد؛ پس در همهٔ سطرها
+# دنبال این الگوها می‌گردیم:
+PCB_DESIGNATOR_RE = re.compile(r"^\s*PCB\s*\d*\s*$", re.IGNORECASE)   # PCB100 ،PCB1 ،PCB
+PCB_PART_NAME_RE = re.compile(r"^\s*PCB\b\s*[,،;:\-_]?", re.IGNORECASE)  # «PCB, SBMi» و مانند آن
+
+
+def is_pcb_bom_row(designator: str, part_name: str) -> bool:
+    """
+    آیا این سطر BOM همان «فیبر برد» (خود برد) است؟
+
+    تشخیص محتوایی و مستقل از جایگاه سطر انجام می‌شود تا اگر ردیف جابجا شد
+    (مثلاً دیگر آخرین ردیف نبود) هم باز شناسایی شود:
+
+    * Designator به‌شکل PCB100 / PCB1 / PCB باشد، یا
+    * Part Name با «PCB» + جداکننده شروع شود (مثل «PCB, SBMi»).
+
+    موارد منفیِ عمدی: «Socket,PCB Mount» یا «PCBA…» سطر فیبر به حساب نمی‌آیند.
+    """
+    des = (designator or "").strip()
+    name = (part_name or "").strip()
+    if des and PCB_DESIGNATOR_RE.match(des):
+        return True
+    return bool(name and PCB_PART_NAME_RE.match(name))
 
 
 # ---------------------------------------------------------------------------
@@ -139,10 +165,12 @@ def find_first_matching_headers(df: pd.DataFrame):
 
 
 def _scan_bom_rows(df: pd.DataFrame, header_row: int, col_part: int,
-                   col_qty: int, col_stock: int) -> list[dict]:
+                   col_qty: int, col_stock: int, col_des: int = -1) -> list[dict]:
     """
     پیمایش همهٔ سطرهای بعد از سربرگ و تشخیص «سطر داده» از «غیر داده» —
     منطق دقیقاً همان extract_data است، به‌علاوهٔ نگاشت شمارهٔ سطر و کلید تطبیق.
+    اگر col_des داده شود، مقدار Designator هر سطر هم (برای تشخیص سطر فیبر برد)
+    در خروجی آمده است.
     """
     rows: list[dict] = []
     for r_idx in range(header_row + 1, len(df)):
@@ -175,10 +203,17 @@ def _scan_bom_rows(df: pd.DataFrame, header_row: int, col_part: int,
             is_header_row = True
             qty_num = 0
 
+        des_str = ""
+        if 0 <= col_des < df.shape[1]:
+            des_val = df.iat[r_idx, col_des]
+            if not (pd.isna(des_val) or str(des_val).strip() == ""):
+                des_str = str(des_val).strip()
+
         rows.append({
             'idx': r_idx,              # اندیس دیتافریم ⇒ سطر ورک‌شیت = idx + 1
             'Stock': stock_str,
             'Part Name': part_str,
+            'Designator': des_str,
             'Qty': qty_num,
             'is_data': not is_header_row,
             'key': _count_key(stock_str if stock_str else part_str),
@@ -531,24 +566,37 @@ def _rebuild_bom_sheet_for_layer(ws, df: pd.DataFrame, groups: list[dict]) -> di
       و QTY = تعداد واقعی آن‌ها در این لایه
     * سطرهای تکراریِ یک کد انبار (در BOM اصلی) ادغام می‌شوند
     * کدهایی که در BOM اصلی نیستند اما در لایه هستند، به انتهای جدول اضافه می‌شوند
+    * «سطر فیبر برد» (PCB100 / «PCB, …») — که در فایل نقشهٔ هیچ لایه‌ای نیست —
+      در TOP و BOT هر دو حفظ می‌شود و مقادیرش دست‌نخورده می‌ماند؛ تشخیصِ آن
+      محتوایی است (is_pcb_bom_row) تا اگر جایگاه سطر جابجا شد هم پیدا شود.
     * ستون «pcb» بعد از آخرین عنوان BOM اضافه و شرح قطعهٔ هر کد (از فایل نقشه) در آن نوشته می‌شود
     * سربرگ/عنوان‌ها و سطرهای غیرداده دست‌نخورده می‌مانند
     """
     header_row, col_part, col_qty, col_stock, col_des, col_item = _find_bom_columns(df)
-    stats = {"rewritten": 0, "deleted": 0, "appended": 0}
+    stats = {"rewritten": 0, "deleted": 0, "appended": 0,
+             "pcb_kept": 0, "pcb_designators": []}
     if header_row == -1 or col_stock == -1 or col_qty == -1:
         return stats
 
     pcb_col = _add_pcb_title(ws, df, header_row)   # ستون «pcb» — بعد از آخرین عنوان BOM
 
     by_key = {g['key']: g for g in groups}
-    scans = _scan_bom_rows(df, header_row, col_part, col_qty, col_stock)
+    scans = _scan_bom_rows(df, header_row, col_part, col_qty, col_stock, col_des)
 
     seen: set[str] = set()
     delete_ws_rows: list[int] = []
     data_rows = [s for s in scans if s['is_data']]
     for s in data_rows:
         ws_r = s['idx'] + 1
+        if is_pcb_bom_row(s['Designator'], s['Part Name']):
+            # «سطر فیبر برد» در هر دو خروجی TOP و BOT باید باشد؛ پس حذف نمی‌شود
+            # و مقادیرش (Designator/QTY/…) عیناً از BOM اصلی می‌ماند. ستون pcb
+            # هم شرح خودِ فیبر را می‌گیرد تا برای پشت و روی برد اعلام شده باشد.
+            seen.add(s['key'])   # اگر تصادفاً در نقشهٔ لایه هم بود، دوباره اضافه نشود
+            ws.cell(row=ws_r, column=pcb_col).value = s['Part Name']
+            stats["pcb_kept"] += 1
+            stats["pcb_designators"].append(s['Designator'] or s['Part Name'])
+            continue
         if s['key'] not in by_key or s['key'] in seen:
             delete_ws_rows.append(ws_r)
             continue
@@ -563,7 +611,13 @@ def _rebuild_bom_sheet_for_layer(ws, df: pd.DataFrame, groups: list[dict]) -> di
     # افزودن کدهای انبارِ موجود در لایه ولی غایب از BOM اصلی
     new_groups = [g for g in groups if g['key'] not in seen]
     if new_groups and data_rows:
-        ref_row = data_rows[-1]['idx'] + 1          # آخرین سطر دادهٔ اصلی (قبل از حذف‌ها)
+        # نقطهٔ درج: بعد از آخرین سطر دادهٔ «غیرِ فیبر»، تا سطر فیبر برد همیشه
+        # در جای خودش (معمولاً آخرین ردیف جدول) بماند و کدهای تازه قبل از آن بیایند.
+        non_pcb_rows = [
+            s for s in data_rows
+            if not is_pcb_bom_row(s['Designator'], s['Part Name'])
+        ]
+        ref_row = (non_pcb_rows or data_rows)[-1]['idx'] + 1   # آخرین سطر دادهٔ اصلی
         ws.insert_rows(ref_row + 1, amount=len(new_groups))
         style_cols = {col_item, col_des, col_part, col_qty, col_stock, pcb_col - 1}
         for offset, g in enumerate(new_groups):
@@ -605,16 +659,23 @@ def _renumber_items(ws, header_row0: int, col_item0: int,
     for r in range(start_row, ws.max_row + 1):
         stock = ws.cell(row=r, column=col_stock0 + 1).value
         qty = ws.cell(row=r, column=col_qty0 + 1).value
-        if stock in (None, "") or not isinstance(qty, (int, float)):
+        if stock in (None, "") or qty in (None, ""):
             continue
         if any(kw in str(stock).strip().lower() for kw in HEADER_KEYWORDS):
             continue  # زیرسربرگ «Stock No.»
+        try:
+            # QTY گاهی به‌صورت متنِ عددی (مثل '1') ذخیره می‌شود — مخصوصاً در
+            # سطرهای دست‌نخورده مانند «فیبر برد»؛ هر دو نوع پذیرفته می‌شوند.
+            float(str(qty).strip())
+        except ValueError:
+            continue
         n += 1
         ws.cell(row=r, column=col_item0 + 1).value = n
 
 
 def _add_layer_report_sheet(wb, layer: str, groups: list[dict],
-                            bom_keys: set[str], placement_path: str) -> None:
+                            bom_keys: set[str], placement_path: str,
+                            pcb_designators: list[str] | None = None) -> None:
     """گزارش لایه: کد انبار، نام قطعه، تعداد دیزاینیتور و وضعیت حضور در BOM اصلی."""
     title = "Layer Report"
     if title in wb.sheetnames:
@@ -632,6 +693,8 @@ def _add_layer_report_sheet(wb, layer: str, groups: list[dict],
     ws.append([f"کدهای انبار لایه: {len(groups)}",
                f"موجود در BOM اصلی: {in_bom}",
                f"جدید (فقط در فایل لایه): {len(groups) - in_bom}"])
+    if pcb_designators:
+        ws.append([f"فیبر برد (در TOP و BOT هر دو حفظ شد): {', '.join(pcb_designators)}"])
     ws.append([])
 
     header = ["Stock ID", "Part Name", "Designator Count", "Designators", "In Original BOM"]
@@ -694,6 +757,7 @@ def build_layer_workbook(bom_path: str, placement_path: str, layer: str,
     records, _, records_ok = parse_placement_records(placement_path, layer)
     groups = aggregate_layer(records) if records_ok else []
     bom_keys: set[str] = set()
+    rebuild_stats: dict = {}
     if bom_sheet:
         df = pd.read_excel(bom_path, sheet_name=bom_sheet, header=None, engine="openpyxl")
         header_row, col_part, col_qty, col_stock = find_first_matching_headers(df)
@@ -703,11 +767,12 @@ def build_layer_workbook(bom_path: str, placement_path: str, layer: str,
                 if s['is_data']
             }
         if records_ok:
-            _rebuild_bom_sheet_for_layer(wb[bom_sheet], df, groups)
+            rebuild_stats = _rebuild_bom_sheet_for_layer(wb[bom_sheet], df, groups)
 
     # ۴) گزارش لایه و قفل G4
     if records_ok:
-        _add_layer_report_sheet(wb, layer, groups, bom_keys, placement_path)
+        _add_layer_report_sheet(wb, layer, groups, bom_keys, placement_path,
+                                pcb_designators=rebuild_stats.get("pcb_designators", []))
     apply_g4_lock(wb, bom_sheet)
 
     wb.save(out_path)
